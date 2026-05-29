@@ -82,6 +82,8 @@ interface PoolConfig {
 	};
 	maxRetries: number;
 	retryOnSessionStart: boolean;
+	/** debug 模式：保留异常详情到 .key-state 和通知中 */
+	debug: boolean;
 }
 
 // ── 默认配置 ─────────────────────────────────────────────────
@@ -94,6 +96,7 @@ const DEFAULT_CONFIG: PoolConfig = {
 	},
 	maxRetries: 3,
 	retryOnSessionStart: true,
+	debug: false,
 };
 
 // ── 文件读写 ─────────────────────────────────────────────────
