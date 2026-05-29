@@ -1,0 +1,1 @@
+{"keys": [{"key": "tp-your-first-api-key-here", "label": "primary"}, {"key": "tp-your-second-api-key-here", "label": "backup"}], "_comment": "key-pool keys.json — one entry per API key. label is optional (shown in /pool-status)"}

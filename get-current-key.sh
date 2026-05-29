@@ -5,7 +5,7 @@
 # 兼容 macOS bash 3.x（无 mapfile）
 
 AGENT_DIR="$HOME/.pi/agent/key-pool"
-KEYS_FILE="$AGENT_DIR/api-keys.txt"
+KEYS_FILE="$AGENT_DIR/keys.json"
 STATE_FILE="$AGENT_DIR/.key-state"
 
 if [ ! -f "$KEYS_FILE" ]; then
@@ -13,14 +13,33 @@ if [ ! -f "$KEYS_FILE" ]; then
   exit 1
 fi
 
-# 过滤掉注释和空行，读取有效 keys 到数组（兼容 bash 3.x）
-KEYS=()
-while IFS= read -r line; do
-  [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
-  KEYS+=("$line")
-done < "$KEYS_FILE"
+# 从 JSON 提取 key 数组（支持 {keys: [...]} 或直接 [...]）
+KEYS=$(python3 -c "
+import json, sys
+try:
+    with open('$KEYS_FILE') as f:
+        data = json.load(f)
+    arr = data if isinstance(data, list) else data.get('keys', [])
+    for e in arr:
+        k = e.get('key') if isinstance(e, dict) else e
+        if k: print(k)
+except Exception as ex:
+    print(f'ERROR: {ex}', file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null)
 
-TOTAL=${#KEYS[@]}
+if [ -z "$KEYS" ]; then
+  echo "ERROR: no valid keys in $KEYS_FILE" >&2
+  exit 1
+fi
+
+# 转为数组（兼容 bash 3.x）
+KEYS_ARR=()
+while IFS= read -r line; do
+  [ -n "$line" ] && KEYS_ARR+=("$line")
+done <<< "$KEYS"
+
+TOTAL=${#KEYS_ARR[@]}
 
 if [ "$TOTAL" -eq 0 ]; then
   echo "ERROR: no valid keys in $KEYS_FILE" >&2
@@ -30,10 +49,8 @@ fi
 # 读状态文件（JSON 格式）
 INDEX=0
 if [ -f "$STATE_FILE" ]; then
-  # 用简单方式提取 index 字段
   INDEX=$(grep -o '"index": *[0-9]*' "$STATE_FILE" | head -1 | grep -o '[0-9]*')
 
-  # 校验范围
   if ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -ge "$TOTAL" ]; then
     INDEX=0
   fi
@@ -84,4 +101,4 @@ print('OK')
   fi
 fi
 
-echo "${KEYS[$INDEX]}"
+echo "${KEYS_ARR[$INDEX]}"

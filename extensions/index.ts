@@ -9,7 +9,7 @@
  *   5. 调试日志     — debug 模式下保留异常详情，方便排查
  *
  * 文件结构（~/.pi/agent/key-pool/）：
- *   api-keys.txt       — key 池（每行一个，# 注释）
+ *   keys.json            — key 池（JSON 格式，支持 label）
  *   pool-config.json    — 可选配置（冷却时间、重试次数、debug 开关）
  *   .key-state          — 运行时状态（自动维护）
  *   get-current-key.sh  — shell 脚本（由 models.json 的 apiKey 引用）
@@ -18,7 +18,7 @@
  *   models.json 中 apiKey 设为 "!bash ~/.pi/agent/key-pool/get-current-key.sh"
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
@@ -26,7 +26,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const HOME = process.env.HOME || "";
 const AGENT_DIR = join(HOME, ".pi", "agent", "key-pool");
-const KEYS_FILE = join(AGENT_DIR, "api-keys.txt");
+const KEYS_FILE = join(AGENT_DIR, "keys.json");
 const STATE_FILE = join(AGENT_DIR, ".key-state");
 const CONFIG_FILE = join(AGENT_DIR, "pool-config.json");
 
@@ -150,16 +150,31 @@ function freshState(): KeyState {
 	return { index: 0, cooled: {}, retryCount: 0 };
 }
 
-function readKeys(): string[] {
+/** Key 池条目 */
+interface KeyEntry {
+	/** API Key 值 */
+	key: string;
+	/** 可选标签（用于 /pool-status 显示） */
+	label?: string;
+}
+
+function readKeys(): KeyEntry[] {
 	try {
-		const raw = readFileSync(KEYS_FILE, "utf-8");
-		return raw
-			.split("\n")
-			.map((l) => l.trim())
-			.filter((l) => l && !l.startsWith("#"));
+		if (!existsSync(KEYS_FILE)) return [];
+		const raw = readFileSync(KEYS_FILE, "utf-8").trim();
+		if (!raw) return [];
+		const parsed = JSON.parse(raw);
+		// 支持两种格式：{keys: [...]} 或直接 [...]
+		const arr = Array.isArray(parsed) ? parsed : parsed.keys ?? [];
+		return arr.filter((e: any) => e && typeof e.key === "string");
 	} catch {
 		return [];
 	}
+}
+
+/** 提取纯 key 字符串数组（兼容旧逻辑） */
+function readKeyStrings(): string[] {
+	return readKeys().map((e) => e.key);
 }
 
 // ── 错误分类（借鉴 HA 三分法）──────────────────────────────────
@@ -351,6 +366,21 @@ function markCurrentCooled(reason: ErrorType): void {
 
 export default function (pi: ExtensionAPI) {
 
+	// ── 首次加载自动初始化 ─────────────────────────────────
+	if (!existsSync(AGENT_DIR)) {
+		mkdirSync(AGENT_DIR, { recursive: true });
+	}
+	if (!existsSync(KEYS_FILE) || readFileSync(KEYS_FILE, "utf-8").trim() === "") {
+		writeFileSync(
+			KEYS_FILE,
+			JSON.stringify({ keys: [{ key: "", label: "key-1" }] }, null, 2),
+			"utf-8",
+		);
+	}
+	if (!existsSync(CONFIG_FILE)) {
+		writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf-8");
+	}
+
 	// ── 重试状态（闭包内，可访问 pi）────────────────────────────
 	let isRetrying = false;
 
@@ -396,7 +426,7 @@ export default function (pi: ExtensionAPI) {
 			if (keys.length === 1) {
 				ctx.ui.notify(`key-pool: 1 key loaded`, "info");
 			} else {
-				ctx.ui.notify("key-pool: api-keys.txt is empty", "error");
+				ctx.ui.notify("key-pool: keys.json is empty or missing", "error");
 			}
 			return;
 		}
@@ -514,7 +544,7 @@ export default function (pi: ExtensionAPI) {
 			const config = loadConfig();
 
 			if (keys.length === 0) {
-				ctx.ui.notify("api-keys.txt 为空或不存在", "error");
+				ctx.ui.notify("key-pool: keys.json is empty or not found", "error");
 				return;
 			}
 
@@ -528,7 +558,9 @@ export default function (pi: ExtensionAPI) {
 			lines.push("");
 
 			for (let i = 0; i < keys.length; i++) {
-				const masked = keys[i].slice(0, 14) + "...";
+				const entry = keys[i];
+				const masked = entry.key.slice(0, 14) + "...";
+				const label = entry.label ? `(${entry.label})` : "";
 				const parts: string[] = [];
 
 				// 当前标记
@@ -542,7 +574,7 @@ export default function (pi: ExtensionAPI) {
 					parts.push(`✅ ${entry.reason} (recovered)`);
 				}
 
-				lines.push(`  #${i + 1}  ${masked}${parts.length ? "  — " + parts.join(", ") : ""}`);
+				lines.push(`  #${i + 1}  ${masked}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
 			}
 
 			lines.push("");
