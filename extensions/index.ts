@@ -460,7 +460,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			const now = Date.now();
 			const cooledCount = Object.keys(state.cooled).length;
 			const activeCooled = Object.entries(state.cooled).filter(
 				([, entry]) => isCooled(entry),
