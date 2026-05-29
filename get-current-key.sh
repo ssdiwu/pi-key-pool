@@ -1,8 +1,7 @@
 #!/bin/bash
-# 读取 ~/.pi/agent/key-pool/.key-state 获取当前应使用的 key 索引
-# 由 pi-key-pool extension 在 session_start / 失败时维护
-# 支持冷却期自动跳过
-# 兼容 macOS bash 3.x（无 mapfile）
+# 读取 ~/.pi/agent/key-pool/ 状态，输出当前应使用的 API key
+# 由 pi-key-pool extension 在轮换时维护 .key-state
+# 兼容 macOS bash 3.x
 
 AGENT_DIR="$HOME/.pi/agent/key-pool"
 KEYS_FILE="$AGENT_DIR/keys.json"
@@ -13,92 +12,55 @@ if [ ! -f "$KEYS_FILE" ]; then
   exit 1
 fi
 
-# 从 JSON 提取 key 数组（支持 {keys: [...]} 或直接 [...]）
-KEYS=$(python3 -c "
-import json, sys
+# 用 python3 从 JSON 提取 key 数组并找到当前活跃的
+python3 -c "
+import json, sys, time
+
 try:
     with open('$KEYS_FILE') as f:
         data = json.load(f)
     arr = data if isinstance(data, list) else data.get('keys', [])
-    for e in arr:
-        k = e.get('key') if isinstance(e, dict) else e
-        if k: print(k)
+    keys = [e.get('key') if isinstance(e, dict) else e for e in arr if e]
+
+    if not keys:
+        print('ERROR: no keys in $KEYS_FILE', file=sys.stderr)
+        sys.exit(1)
+
+    # 读状态获取 index
+    idx = 0
+    try:
+        with open('$STATE_FILE') as f:
+            state = json.load(f)
+        idx = state.get('index', 0)
+    except:
+        pass
+
+    idx = idx % len(keys)
+
+    # 检查冷却：如果当前 key 冷却中，找下一个非冷却的
+    cooled = {}
+    try:
+        with open('$STATE_FILE') as f:
+            state = json.load(f)
+        cooled = state.get('cooled', {})
+    except:
+        pass
+
+    def is_cooled(i):
+        e = cooled.get(str(i))
+        if not e: return False
+        return time.time() * 1000 - e['exhaustedAt'] < e['cooldownMs']
+
+    if is_cooled(idx):
+        for offset in range(1, len(keys) + 1):
+            cand = (idx + offset) % len(keys)
+            if not is_cooled(cand):
+                idx = cand
+                break
+
+    print(keys[idx])
+
 except Exception as ex:
     print(f'ERROR: {ex}', file=sys.stderr)
     sys.exit(1)
-" 2>/dev/null)
-
-if [ -z "$KEYS" ]; then
-  echo "ERROR: no valid keys in $KEYS_FILE" >&2
-  exit 1
-fi
-
-# 转为数组（兼容 bash 3.x）
-KEYS_ARR=()
-while IFS= read -r line; do
-  [ -n "$line" ] && KEYS_ARR+=("$line")
-done <<< "$KEYS"
-
-TOTAL=${#KEYS_ARR[@]}
-
-if [ "$TOTAL" -eq 0 ]; then
-  echo "ERROR: no valid keys in $KEYS_FILE" >&2
-  exit 1
-fi
-
-# 读状态文件（JSON 格式）
-INDEX=0
-if [ -f "$STATE_FILE" ]; then
-  INDEX=$(grep -o '"index": *[0-9]*' "$STATE_FILE" | head -1 | grep -o '[0-9]*')
-
-  if ! [[ "$INDEX" =~ ^[0-9]+$ ]] || [ "$INDEX" -ge "$TOTAL" ]; then
-    INDEX=0
-  fi
-
-  # 检查当前 key 是否在冷却中
-  CURRENT_COOL=$(python3 -c "
-import json, sys, time
-try:
-    with open('$STATE_FILE') as f:
-        state = json.load(f)
-    entry = state.get('cooled', {}).get(str($INDEX))
-    if entry:
-        exhausted = entry.get('exhaustedAt', 0)
-        cooldown = entry.get('cooldownMs', 0)
-        if time.time() * 1000 - exhausted < cooldown:
-            print('COOLED')
-            sys.exit(0)
-except Exception:
-    pass
-print('OK')
-" 2>/dev/null)
-
-  if [ "$CURRENT_COOL" = "COOLED" ]; then
-    # 当前 key 在冷却中 — 尝试找下一个非冷却的
-    for i in $(seq 1 $TOTAL); do
-      NEXT=$(( (INDEX + i) % TOTAL ))
-      NEXT_COOL=$(python3 -c "
-import json, sys, time
-try:
-    with open('$STATE_FILE') as f:
-        state = json.load(f)
-    entry = state.get('cooled', {}).get(str($NEXT))
-    if entry:
-        exhausted = entry.get('exhaustedAt', 0)
-        cooldown = entry.get('cooldownMs', 0)
-        if time.time() * 1000 - exhausted < cooldown:
-            print('COOLED')
-            sys.exit(0)
-except Exception:
-    pass
-print('OK')
-" 2>/dev/null)
-      if [ "$NEXT_COOL" = "OK" ]; then
-        INDEX=$NEXT
-        break
-      fi
-    done
-  fi
-fi
-
-echo "${KEYS_ARR[$INDEX]}"
+" 2>/dev/null
