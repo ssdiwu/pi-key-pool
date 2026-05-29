@@ -104,6 +104,32 @@ function loadConfig(): PoolConfig {
 	} catch { return DEFAULT_CONFIG; }
 }
 
+/**
+ * 检测并补充缺失的配置字段
+ * 保留用户已有的值，只添加新字段的默认值
+ */
+function migrateConfig(): void {
+	try {
+		if (!existsSync(CONFIG_FILE)) return;
+		const raw = readFileSync(CONFIG_FILE, "utf-8").trim();
+		if (!raw) return;
+		
+		const existing = JSON.parse(raw);
+		const merged = { ...DEFAULT_CONFIG, ...existing };
+		
+		// 检测是否有新增字段
+		const hasNewFields = Object.keys(DEFAULT_CONFIG).some(
+			(key) => !(key in existing)
+		);
+		
+		if (hasNewFields) {
+			writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
+		}
+	} catch {
+		// 静默失败，不影响启动
+	}
+}
+
 function loadState(): KeyState {
 	try {
 		if (!existsSync(STATE_FILE)) return freshState();
@@ -358,6 +384,9 @@ export default function (pi: ExtensionAPI) {
 		writeFileSync(KEYS_FILE, JSON.stringify({ keys: [{ key: "", label: "key-1" }] }, null, 2), "utf-8");
 	if (!existsSync(CONFIG_FILE))
 		writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf-8");
+	
+	// 检测并补充缺失的配置字段（版本升级兼容）
+	migrateConfig();
 
 	autoConfigureModelsJson();
 
