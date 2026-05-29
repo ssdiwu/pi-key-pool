@@ -558,20 +558,20 @@ export default function (pi: ExtensionAPI) {
 			lines.push("");
 
 			for (let i = 0; i < keys.length; i++) {
-				const entry = keys[i];
-				const masked = entry.key.slice(0, 14) + "...";
-				const label = entry.label ? `(${entry.label})` : "";
+				const keyEntry = keys[i];
+				const masked = keyEntry.key.slice(0, 14) + "...";
+				const label = keyEntry.label ? `(${keyEntry.label})` : "";
 				const parts: string[] = [];
 
 				// 当前标记
 				if (i === state.index) parts.push("◀ active");
 
 				// 冷却状态
-				const entry = state.cooled[String(i)];
-				if (entry && isCooled(entry)) {
-					parts.push(`❄️ ${entry.reason} ${formatCooldown(remainingCooldown(entry))}`);
-				} else if (entry) {
-					parts.push(`✅ ${entry.reason} (recovered)`);
+				const cooled = state.cooled[String(i)];
+				if (cooled && isCooled(cooled)) {
+					parts.push(`❄️ ${cooled.reason} ${formatCooldown(remainingCooldown(cooled))}`);
+				} else if (cooled) {
+					parts.push(`✅ ${cooled.reason} (recovered)`);
 				}
 
 				lines.push(`  #${i + 1}  ${masked}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
