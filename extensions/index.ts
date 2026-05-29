@@ -361,6 +361,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// ── 启动时立即同步当前 key 到 auth.json ──────────────
+	// 确保 pi 读 auth.json 时拿到的是池中的最新 key
+	syncKeyToAuth();
+
 	// ── 重试状态（闭包内，可访问 pi）────────────────────────────
 	let isRetrying = false;
 
