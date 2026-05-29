@@ -1,1 +1,1 @@
-{"cooldownMs": {"capacity": 30000, "quota": 300000, "network": 0}, "maxRetries": 3, "retryOnSessionStart": true}
+{"cooldownMs": {"capacity": 30000, "quota": 300000, "network": 0}, "maxRetries": 3, "retryOnSessionStart": true, "debug": false}

@@ -8,29 +8,47 @@ API key pool manager for [pi](https://github.com/earendil-works/pi) coding agent
 - **Cooldown recovery** — failed keys enter a timed cooldown (configurable per error type) and auto-recover when expired, no manual reset needed
 - **Smart retry** — on quota/capacity errors, automatically switches to the next healthy key and retries the last user message transparently
 - **Error classification** — distinguishes capacity / quota / network errors with independent cooldown and retry strategies per type
-- **Zero-config for basic use** — just drop your keys into `~/.pi/api-keys.txt`
+- **Debug logging** — optional debug mode preserves error details in state file for troubleshooting
+- **Zero-config for basic use** — just drop your keys into the pool
+
+## File Structure
+
+All files live under `~/.pi/agent/key-pool/`:
+
+```
+~/.pi/agent/key-pool/
+├── index.ts            # Extension main code
+├── get-current-key.sh  # Shell script (called by models.json apiKey)
+├── api-keys.txt        # Your API key pool (one per line)
+├── pool-config.json    # Optional configuration
+└── .key-state          # Runtime state (auto-managed)
+```
 
 ## Install
 
 ```bash
-# From npm (when published)
-pi install npm:pi-key-pool
+# Clone or download to your preferred location
+git clone https://github.com/yourname/pi-key-pool.git
 
-# Or from git
-pi install git:github.com/yourname/pi-key-pool
+# Copy extension to pi's agent directory
+mkdir -p ~/.pi/agent/key-pool
+cp pi-key-pool/extensions/index.ts       ~/.pi/agent/key-pool/index.ts
+cp pi-key-pool/get-current-key.sh         ~/.pi/agent/key-pool/get-current-key.sh
+chmod +x ~/.pi/agent/key-pool/get-current-key.sh
 
-# For development — symlink to your extensions dir
-ln -s /path/to/pi-key-pool/extensions/index.ts ~/.pi/extensions/key-pool/index.ts
+# Create config (optional, has sensible defaults)
+cp pi-key-pool/pool-config.example.json  ~/.pi/agent/key-pool/pool-config.json
 ```
 
 ## Quick Start
 
-1. Add your API keys (one per line) to `~/.pi/api-keys.txt`:
+1. Add your API keys (one per line) to `~/.pi/agent/key-pool/api-keys.txt`:
 
 ```
-sk-ant-api03-first-key-here
-sk-ant-api03-second-key-here
-sk-ant-api03-third-key-here
+# Comments with # are ignored
+tp-your-first-key-here
+tp-your-second-key-here
+tp-your-third-key-here
 ```
 
 2. Configure `~/.pi/models.json` to use the key pool:
@@ -40,7 +58,7 @@ sk-ant-api03-third-key-here
   "providers": {
     "anthropic": {
       "baseUrl": "https://api.anthropic.com",
-      "apiKey": "!bash ~/.pi/get-current-key.sh",
+      "apiKey": "!bash ~/.pi/agent/key-pool/get-current-key.sh",
       "api": "anthropic-messages"
     }
   }
@@ -53,15 +71,15 @@ sk-ant-api03-third-key-here
 
 | Command | Description |
 |---------|-------------|
-| `/pool-status` | View key pool health, current active key, cooldown status |
-| `/pool-reset` | Manually clear all cooldown marks |
+| `/pool-status` | View key pool health, current active key, cooldown status, recent debug log |
+| `/pool-reset` | Manually clear all cooldown marks and debug log |
 
 ## Config
 
-### `~/.pi/api-keys.txt`
+### `~/.pi/agent/key-pool/api-keys.txt`
 One API key per line. Lines starting with `#` are comments.
 
-### `~/.pi/pool-config.json` (optional)
+### `~/.pi/agent/key-pool/pool-config.json` (optional)
 
 ```json
 {
@@ -71,7 +89,8 @@ One API key per line. Lines starting with `#` are comments.
     "network": 0
   },
   "maxRetries": 3,
-  "retryOnSessionStart": true
+  "retryOnSessionStart": true,
+  "debug": false
 }
 ```
 
@@ -82,6 +101,7 @@ One API key per line. Lines starting with `#` are comments.
 | `cooldownMs.network` | `0` (no cooldown) | Network errors don't cool keys down |
 | `maxRetries` | `3` | Max automatic retries before giving up |
 | `retryOnSessionStart` | `true` | Rotate to next key on new session |
+| `debug` | `false` | When `true`, preserves error details in `.key-state` and shows them in `/pool-status` |
 
 ## How It Works
 
@@ -98,6 +118,25 @@ turn_end → check assistant message for errors
 cooldown expires → key becomes eligible again automatically
 ```
 
+### Error Classification
+
+| Type | Patterns | Cooldown | Action |
+|------|----------|----------|--------|
+| **capacity** | overloaded, capacity, 529 | 30s | Switch + retry |
+| **quota** | 429, rate limit, too many requests | 5min | Switch + retry |
+| **network** | connection reset, timeout, fetch failed | 0 (none) | Don't switch, let pi handle |
+| **unknown** | anything else | 0 | Ignore |
+
+### Debug Mode
+
+When `"debug": true` is set in config:
+
+- Error details are appended to `.key-state.debugLog[]` (last 50 entries kept)
+- `/pool-status` shows recent error log with timestamps
+- Max-retries notification includes the actual error message
+- Network error notifications include the raw error text
+- `/pool-reset` clears both cooldown marks and debug log
+
 ## Design Decisions (vs alternatives)
 
 | Feature | pi-key-pool | pi-multi-pass | pi-high-availability |
@@ -106,9 +145,23 @@ cooldown expires → key becomes eligible again automatically
 | Cooldown recovery | ✅ time-based | ✅ 5min fixed | ✅ configurable |
 | Auto-retry | ✅ transparent | ✅ | ✅ |
 | Error classification | ✅ 3-tier | ❌ unified | ✅ 3-tier |
-| Size | ~350 lines | ~17K lines | ~400 lines |
+| Debug logging | ✅ opt-in | ❌ | ❌ |
+| Size | ~550 lines | ~17K lines | ~400 lines |
 | OAuth support | ❌ API keys only | ✅ full lifecycle | ✅ both |
 | TUI management panel | ❌ commands only | ✅ full TUI | ✅ accordion UI |
+
+## Testing
+
+```bash
+# Test shell script directly
+~/.pi/agent/key-pool/get-current-key.sh
+
+# Check pool status (after loading extension)
+/pool-status
+
+# Reset all cooldowns
+/pool-reset
+```
 
 ## License
 

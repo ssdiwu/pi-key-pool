@@ -6,14 +6,16 @@
  *   2. 冷却恢复     — 失败 key 带时间戳标记，到期自动恢复
  *   3. 自动重试     — 切换 key 后自动重发上一条用户消息（用户无感）
  *   4. 错误分类     — capacity / quota / network 三类独立策略
+ *   5. 调试日志     — debug 模式下保留异常详情，方便排查
  *
- * 配置文件：
- *   ~/.pi/api-keys.txt     — key 池（每行一个，# 注释）
- *   ~/.pi/pool-config.json — 可选配置（冷却时间、重试次数等）
- *   ~/.pi/.key-state       — 运行时状态（自动维护）
+ * 文件结构（~/.pi/agent/key-pool/）：
+ *   api-keys.txt       — key 池（每行一个，# 注释）
+ *   pool-config.json    — 可选配置（冷却时间、重试次数、debug 开关）
+ *   .key-state          — 运行时状态（自动维护）
+ *   get-current-key.sh  — shell 脚本（由 models.json 的 apiKey 引用）
  *
  * 用法：
- *   models.json 中 apiKey 设为 "!bash ~/.pi/get-current-key.sh"
+ *   models.json 中 apiKey 设为 "!bash ~/.pi/agent/key-pool/get-current-key.sh"
  */
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -23,9 +25,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 // ── 路径常量 ────────────────────────────────────────────────
 
 const HOME = process.env.HOME || "";
-const KEYS_FILE = join(HOME, ".pi", "api-keys.txt");
-const STATE_FILE = join(HOME, ".pi", ".key-state");
-const CONFIG_FILE = join(HOME, ".pi", "pool-config.json");
+const AGENT_DIR = join(HOME, ".pi", "agent", "key-pool");
+const KEYS_FILE = join(AGENT_DIR, "api-keys.txt");
+const STATE_FILE = join(AGENT_DIR, ".key-state");
+const CONFIG_FILE = join(AGENT_DIR, "pool-config.json");
 
 // ── 类型定义 ─────────────────────────────────────────────────
 
@@ -47,6 +50,17 @@ interface KeyState {
 	cooled: Record<string, CooldownEntry>;
 	/** 本会话内已连续重试次数 */
 	retryCount: number;
+	/** debug 模式下的异常日志 */
+	debugLog?: DebugEntry[];
+}
+
+/** debug 日志条目 */
+interface DebugEntry {
+	timestamp: number;
+	keyIndex: number;
+	errorType: ErrorType;
+	errorMessage: string;
+	action: string;
 }
 
 /** 错误类型分类 */
@@ -230,6 +244,32 @@ function formatCooldown(ms: number): string {
 	return `~${mins}m`;
 }
 
+// ── Debug 日志 ───────────────────────────────────────────────
+
+/**
+ * 写入一条 debug 日志到 state（仅 debug 模式下）
+ */
+function appendDebugLog(
+	state: KeyState,
+	keyIndex: number,
+	errorType: ErrorType,
+	errorMessage: string,
+	action: string,
+): void {
+	if (!state.debugLog) state.debugLog = [];
+	state.debugLog.push({
+		timestamp: Date.now(),
+		keyIndex,
+		errorType,
+		errorMessage: errorMessage.slice(0, 500),
+		action,
+	});
+	// 只保留最近 50 条
+	if (state.debugLog.length > 50) {
+		state.debugLog = state.debugLog.slice(-50);
+	}
+}
+
 // ── 核心：轮换到下一个可用 key ───────────────────────────────
 
 /**
@@ -382,15 +422,20 @@ export default function (pi: ExtensionAPI) {
 		if (msg.stopReason !== "error") return;
 
 		const config = loadConfig();
-		const state = loadState();
+		let state = loadState();
 		const keys = readKeys();
 
 		// 重试次数上限检查
 		if (state.retryCount >= config.maxRetries) {
+			const errMsg = msg.errorMessage ?? "unknown";
 			ctx.ui.notify(
-				`❌ key-pool: max retries (${config.maxRetries}) reached. Giving up.`,
+				`❌ key-pool: max retries (${config.maxRetries}) reached. Giving up.${config.debug ? ` Error: ${errMsg.slice(0, 120)}` : ""}`,
 				"error",
 			);
+			if (config.debug) {
+				appendDebugLog(state, state.index, "unknown", errMsg, "max-retries-exceeded");
+				saveState(state);
+			}
 			state.retryCount = 0;
 			saveState(state);
 			return;
@@ -402,9 +447,13 @@ export default function (pi: ExtensionAPI) {
 			// network error → 不切 key，让 pi 自己的重试机制处理
 			if (classification.type === "network") {
 				ctx.ui.notify(
-					`⚡ key-pool: network error (not switching key)`,
+					`⚡ key-pool: network error (not switching key)${config.debug ? `: ${(msg.errorMessage ?? "").slice(0, 80)}` : ""}`,
 					"info",
 				);
+				if (config.debug) {
+					appendDebugLog(state, state.index, "network", msg.errorMessage ?? "", "no-switch");
+					saveState(state);
+				}
 			}
 			return;
 		}
@@ -428,6 +477,12 @@ export default function (pi: ExtensionAPI) {
 		// 递增重试计数
 		const updatedState = loadState();
 		updatedState.retryCount++;
+
+		// debug 日志
+		if (config.debug) {
+			appendDebugLog(updatedState, oldIndex, classification.type, msg.errorMessage ?? "", `switch→#${newIndex + 1}`);
+		}
+
 		saveState(updatedState);
 
 		// 通知用户
@@ -505,8 +560,9 @@ export default function (pi: ExtensionAPI) {
 			const count = Object.keys(state.cooled).length;
 			state.cooled = {};
 			state.retryCount = 0;
+			if (state.debugLog) state.debugLog = [];
 			saveState(state);
-			ctx.ui.notify(`Pool reset: ${count} cooldowns cleared`, "info");
+			ctx.ui.notify(`Pool reset: ${count} cooldowns cleared${state.debugLog ? ", debug log cleared" : ""}`, "info");
 		},
 	});
 }
