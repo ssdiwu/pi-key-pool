@@ -302,42 +302,44 @@ function markCurrentCooled(reason: ErrorType): void {
 }
 
 // ── 核心自动重试（借鉴 HA retryTurn）──────────────────────────
-
-let isRetrying = false;
-
-function retryLastUserMessage(ctx: Parameters<ExtensionAPI["on"]>[1]): void {
-	if (isRetrying) return;
-
-	const branch = ctx.sessionManager.getBranch();
-	const lastUser = branch
-		.slice()
-		.reverse()
-		.find((e: any) => e.type === "message" && e.message?.role === "user");
-
-	if (!lastUser?.message?.content) return;
-
-	isRetrying = true;
-	ctx.ui.notify("🔄 Switching key and retrying...", "warning");
-
-	pi.sendMessage(
-		{
-			customType: "key-pool",
-			content: `[auto-retry] ${typeof lastUser.message.content === "string"
-				? lastUser.message.content
-				: JSON.stringify(lastUser.message.content)
-				}`,
-			display: false,
-		},
-		{ deliverAs: "steer" },
-	);
-
-	// 防重入锁 5 秒后释放
-	setTimeout(() => { isRetrying = false; }, 5000);
-}
+// 注意：必须在工厂函数内部定义以访问 pi 闭包变量
 
 // ── Extension 入口 ─────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
+
+	// ── 重试状态（闭包内，可访问 pi）────────────────────────────
+	let isRetrying = false;
+
+	function retryLastUserMessage(ctx: Parameters<ExtensionAPI["on"]>[1]): void {
+		if (isRetrying) return;
+
+		const branch = ctx.sessionManager.getBranch();
+		const lastUser = branch
+			.slice()
+			.reverse()
+			.find((e: any) => e.type === "message" && e.message?.role === "user");
+
+		if (!lastUser?.message?.content) return;
+
+		isRetrying = true;
+		ctx.ui.notify("🔄 Switching key and retrying...", "warning");
+
+		pi.sendMessage(
+			{
+				customType: "key-pool",
+				content: `[auto-retry] ${typeof lastUser.message.content === "string"
+					? lastUser.message.content
+					: JSON.stringify(lastUser.message.content)
+					}`,
+				display: false,
+			},
+			{ deliverAs: "steer" },
+		);
+
+		// 防重入锁 5 秒后释放
+		setTimeout(() => { isRetrying = false; }, 5000);
+	}
 
 	// ════════════════════════════════════════════════════════════
 	// 策略 1：新会话轮换
