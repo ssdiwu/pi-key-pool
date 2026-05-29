@@ -17,10 +17,11 @@ When you have multiple API keys and want to:
 
 | Feature | Description |
 |---------|-------------|
-| **Session-based rotation** | New session (`/new`) → next available key. Same session keeps the same key (preserves prompt cache) |
+| **Session-based binding** | Each session is bound to a unique key — parallel sessions use different keys automatically |
 | **Cooldown recovery** | Failed keys enter timed cooldown, auto-recover when expired. No manual reset needed |
 | **Smart retry** | On quota/capacity error → switch key → auto-retry last message. User sees nothing |
 | **Error classification** | 3 tiers: `capacity` (30s) / `quota` (5min) / `network` (no switch). Independent strategy per type |
+| **Zombie cleanup** | Auto-clean stale session bindings on startup (TTL: 1 hour) |
 | **Auto provider detection** | Reads `provider` field from `keys.json`, auto-configures `models.json`. No hardcoded providers |
 | **Debug mode** | Optional error logging to `.key-state`, visible in `/pool-status` |
 | **Zero-config basics** | Drop keys in → works out of the box |
@@ -97,14 +98,15 @@ Cooldowns: capacity=30s, quota=300s, network=off
 ┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
 │  keys.json  │────▶│ get-current-key  │────▶│   API Request    │
 │  (key pool) │     │  .sh (!bash)     │     │  (correct key    │
-└─────────────┘     │  reads .key-state │     │   injected)       │
-                   └──────────────────┘     └──────────────────┘
+└─────────────┘     │  reads session   │     │   injected)       │
+                   │  + .key-state    │     └──────────────────┘
+                   └──────────────────┘              │
                             ▲                         │
                             │                         │
                    ┌────────┴─────────┐             │
                    │  .key-state      │◀────────────┘
-                   │  (managed by      │  session_start / turn_end
-                   │   extension)     │
+                   │  + .current-     │  session_start / turn_end
+                   │    session       │
                    └──────────────────┘
 ```
 
@@ -112,16 +114,23 @@ Cooldowns: capacity=30s, quota=300s, network=off
 
 ```
 /new (new session)
-  ├─ session_start → rotateToNext() → write .key-state
-  └─ Next request → !bash script reads new index → outputs new key ✅
+  ├─ session_start → generate sessionId → assignKeyToSession()
+  ├─ write .current-session + .key-state (assignments)
+  └─ Next request → !bash script reads session → outputs bound key ✅
 
-Normal request (same session)
-  └─ !bash script reads same index → outputs same key (cache preserved) ✅
+Parallel sessions
+  ├─ Session A → key #1 (exclusive)
+  ├─ Session B → key #2 (exclusive)
+  └─ Session C → key #1 (if released by A) ✅
 
 API error (429/529)
-  ├─ turn_end → classify error → mark cooled → rotateToNext()
-  ├─ write .key-state (new index)
+  ├─ turn_end → classify error → mark cooled → reassign
+  ├─ write .key-state (new assignment)
   └─ retryLastUserMessage() → transparent retry with new key ✅
+
+Session ends (/new, /resume, exit)
+  ├─ session_shutdown → releaseSessionAssignment()
+  └─ Key becomes available for other sessions ✅
 
 Cooldown expires
   └─ isCooled() returns false → key becomes eligible again ✅
@@ -139,7 +148,7 @@ Cooldown expires
     "network": 0
   },
   "maxRetries": 3,
-  "retryOnSessionStart": true,
+  "assignmentTtlMs": 3600000,
   "debug": false
 }
 ```
@@ -150,7 +159,7 @@ Cooldown expires
 | `cooldownMs.quota` | `300000` (5min) | Rate limit / 429 errors — standard recovery |
 | `cooldownMs.network` | `0` (no cooldown) | Network errors — don't blame the key |
 | `maxRetries` | `3` | Max consecutive retries before giving up |
-| `retryOnSessionStart` | `true` | Rotate key on `/new` |
+| `assignmentTtlMs` | `3600000` (1h) | TTL for stale session assignments (zombie cleanup) |
 | `debug` | `false` | Enable error logging (see below) |
 
 ### `~/.pi/agent/key-pool/keys.json`
@@ -173,25 +182,28 @@ Cooldown expires
 
 | Command | Description |
 |---------|-------------|
-| `/pool-status` | Show pool health, active key, cooldown status, recent debug log |
+| `/pool-status` | Show pool health, active sessions, cooldown status, recent debug log |
 | `/pool-reset` | Clear all cooldown marks and debug log |
+| `/pool-clean` | Clean stale session bindings (zombie cleanup) |
 
 ### Example output (debug mode ON)
 
 ```
-Key Pool: 3 keys | #2 active | 1 cooling
-Target: auth.json/xiaomi-token-plan-cn
+Key Pool: 3 keys | 2 sessions | 1 cooling
 
-  #1  tp-cuc...xxxxx... (primary)  — ❄️ quota ~3m
-  #2  tp-cuq0...xxxxx... (backup)  — ◀ active
+Current session: a7f52d8d... → key #2 (backup)
+
+  #1  tp-cuc...xxxxx... (primary)  — sessions: 73be6226...  — ❄️ quota ~3m
+  #2  tp-cuq0...xxxxx... (backup)  — sessions: a7f52d8d...
   #3  tp-cwzl...xxxxx... (test)    — ✅ quota (recovered)
 
 Retry: 0/3 | Debug: ON
 Cooldowns: capacity=30s, quota=300s, network=off
+Assignment TTL: 60min
 
 --- Debug Log ---
-  [14:32:01] #1 [quota] switch→#2: status_code: 429 rate limit exceeded
-  [14:35:22] #2 [capacity] switch→#3: engine overloaded
+  [14:32:01] #1 (73be6226...) [quota] switch→#2: status_code: 429 rate limit exceeded
+  [14:35:22] #2 (a7f52d8d...) [capacity] switch→#3: engine overloaded
 ```
 
 ## Error Classification
@@ -211,8 +223,7 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 📦 pi-key-pool/                    # npm package (git repo)
 ├── package.json                   # pi.extensions → "./extensions/index.ts"
 ├── extensions/
-│   └── index.ts                   # Extension code (~416 lines)
-├── get-current-key.sh             # Shell script template
+│   └── index.ts                   # Extension code (~600 lines)
 ├── keys.example.json              # Key pool template
 ├── pool-config.example.json       # Config template
 ├── .npmignore                     # Exclude runtime data from npm
@@ -221,7 +232,8 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 📂 ~/.pi/agent/key-pool/           # Runtime (auto-created)
 ├── keys.json                     # Your actual keys
 ├── pool-config.json              # Your config (optional)
-├── .key-state                    # Runtime state (auto-managed)
+├── .key-state                    # Runtime state (assignments + cooldowns)
+├── .current-session              # Current session ID (for get-current-key.sh)
 └── get-current-key.sh            # Deployed shell script
 ```
 
@@ -231,30 +243,35 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 
 pi loads `auth.json` **before** extensions are initialized. Writing to auth.json from an extension is too late — the current session would still use the old key.
 
-Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` and outputting the correct key. No timing issues.
+Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` and `.current-session` to output the correct key. No timing issues.
 
-### Why session-based rotation (not per-request)?
+### Why session-based binding (not rotation)?
 
-Per-request rotation would break prompt caching — every request would hit a different key, wasting cache warmth. Session-based rotation gives you:
-- **Cache efficiency**: All requests in a session use the same key → warm cache
-- **Load distribution**: Different sessions use different keys → spread across pool
-- **Predictability**: You know which key is active via `/pool-status`
+Previous design used rotation on `/new` — but this had a critical flaw: **parallel sessions could end up with the same key** due to race conditions on the shared state file.
+
+Session-based binding solves this:
+- **Each session gets exclusive key assignment** — no race conditions
+- **Parallel sessions guaranteed different keys** — true load distribution
+- **Session cleanup on exit** — keys are released when session ends
+- **Zombie cleanup** — stale bindings auto-expire after TTL (1 hour)
 
 ### Why shell script instead of pure TS?
 
-pi's `models.json` supports `!bash <command>` for dynamic apiKey resolution. This is the official mechanism for runtime key injection. The shell script is minimal (~65 lines), reads JSON state, handles cooldown skipping, and outputs the chosen key.
+pi's `models.json` supports `!bash <command>` for dynamic apiKey resolution. This is the official mechanism for runtime key injection. The shell script is minimal (~75 lines), reads JSON state, handles cooldown skipping, and outputs the chosen key.
 
 ## vs Alternatives
 
 | Feature | **pi-key-pool** | [pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass) | [pi-high-availability](https://github.com/burggraf/pi-high-availability) |
 |---------|:---:|:---:|:---:|
-| Session rotation | ✅ unique | ❌ | ❌ |
+| Session binding | ✅ exclusive | ❌ | ❌ |
+| Parallel sessions | ✅ guaranteed different keys | ❌ | ❌ |
 | Cooldown recovery | ✅ time-based | ✅ 5min fixed | ✅ configurable |
 | Auto-retry | ✅ transparent | ✅ | ✅ |
 | Error classification | ✅ 3-tier | ❌ unified | ✅ 3-tier |
 | Auto provider detect | ✅ from keys.json | ❌ manual | ❌ manual |
+| Zombie cleanup | ✅ TTL-based | ❌ | ❌ |
 | Debug logging | ✅ opt-in | ❌ | ❌ |
-| Size | **~480 lines** | ~17K lines | ~400 lines |
+| Size | **~600 lines** | ~17K lines | ~400 lines |
 | OAuth support | ❌ API keys only | ✅ full lifecycle | ✅ both |
 | TUI panel | ❌ commands only | ✅ full TUI | ✅ accordion UI |
 
