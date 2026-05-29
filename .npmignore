@@ -1,0 +1,14 @@
+# Runtime data (auto-created, not shipped)
+keys.json
+pool-config.json
+.key-state
+get-current-key.sh
+
+# Development
+.gitignore
+*.md
+!README.md
+
+# OS
+.DS_Store
+Thumbs.db

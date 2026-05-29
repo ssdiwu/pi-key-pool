@@ -1,100 +1,135 @@
 # pi-key-pool
 
-API key pool manager for [pi](https://github.com/earendil-works/pi) coding agent.
+> API Key Pool Manager for [pi](https://github.com/earendil-works/pi) — session-based rotation, cooldown recovery, smart retry, and error classification.
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## Why
+
+When you have multiple API keys and want to:
+
+- **Distribute load** across keys — each new conversation uses a different key
+- **Auto-recover** from transient errors — failed keys cool down and come back automatically
+- **Retry transparently** — when a key fails, switch to the next one and retry without user intervention
+- **Debug easily** — see exactly what happened when things go wrong
 
 ## Features
 
-- **Session-based rotation** — each new session (`/new`) automatically picks the next available key from the pool, preserving prompt cache within a session
-- **Cooldown recovery** — failed keys enter a timed cooldown (configurable per error type) and auto-recover when expired, no manual reset needed
-- **Smart retry** — on quota/capacity errors, automatically switches to the next healthy key and retries the last user message transparently
-- **Error classification** — distinguishes capacity / quota / network errors with independent cooldown and retry strategies per type
-- **Debug logging** — optional debug mode preserves error details in state file for troubleshooting
-- **Zero-config for basic use** — just drop your keys into the pool
+| Feature | Description |
+|---------|-------------|
+| **Session-based rotation** | New session (`/new`) → next available key. Same session keeps the same key (preserves prompt cache) |
+| **Cooldown recovery** | Failed keys enter timed cooldown, auto-recover when expired. No manual reset needed |
+| **Smart retry** | On quota/capacity error → switch key → auto-retry last message. User sees nothing |
+| **Error classification** | 3 tiers: `capacity` (30s) / `quota` (5min) / `network` (no switch). Independent strategy per type |
+| **Auto provider detection** | Reads `provider` field from `keys.json`, auto-configures `models.json`. No hardcoded providers |
+| **Debug mode** | Optional error logging to `.key-state`, visible in `/pool-status` |
+| **Zero-config basics** | Drop keys in → works out of the box |
 
-## Architecture
-
-```
-┌─ Package (loaded by pi via `pi install`) ──────────────────────┐
-│  pi-key-pool/                                                   │
-│  ├── package.json     ← pi.extensions → "./extensions/index.ts" │
-│  ├── extensions/                                                │
-│  │   └── index.ts     ← Extension code (pi loads this)         │
-│  ├── get-current-key.sh   (template, copied on setup)           │
-│  └── pool-config.example.json (template)                        │
-└─────────────────────────────────────────────────────────────────┘
-                          ↓ reads/writes at runtime
-┌─ Runtime data (~/.pi/agent/key-pool/) ─────────────────────────┐
-│  ├── api-keys.txt        ← Your API keys (one per line)        │
-│  ├── pool-config.json    ← Configuration (optional)            │
-│  ├── .key-state          ← Runtime state (auto-managed)        │
-│  └── get-current-key.sh  ← Shell script (models.json → apiKey) │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-## Install
+## Quick Start
 
 ```bash
-# Install from local path
-pi install /path/to/pi-key-pool
+# Install
+pi install npm:pi-key-pool
 
-# Or from git (when published)
-pi install git:github.com/yourname/pi-key-pool
+# Or from git
+pi install git:github.com/ssdiwu/pi-key-pool
 ```
+
+Then configure your keys (see [Setup](#setup)).
 
 ## Setup
 
-### 1. Create runtime directory and copy templates
+### 1. Create key pool
 
-```bash
-mkdir -p ~/.pi/agent/key-pool
-cp pi-key-pool/get-current-key.sh ~/.pi/agent/key-pool/
-chmod +x ~/.pi/agent/key-pool/get-current-key.sh
-cp pi-key-pool/pool-config.example.json ~/.pi/agent/key-pool/pool-config.json
-```
-
-### 2. Add your API keys
-
-Edit `~/.pi/agent/key-pool/api-keys.txt`:
-
-```
-# Comments with # are ignored
-tp-your-first-key-here
-tp-your-second-key-here
-tp-your-third-key-here
-```
-
-### 3. Configure models.json
-
-Edit `~/.pi/models.json`:
+Edit `~/.pi/agent/key-pool/keys.json`:
 
 ```json
 {
-  "providers": {
-    "anthropic": {
-      "baseUrl": "https://api.anthropic.com",
-      "apiKey": "!bash ~/.pi/agent/key-pool/get-current-key.sh",
-      "api": "anthropic-messages"
+  "keys": [
+    {
+      "key": "tp-your-first-key-here",
+      "provider": "xiaomi-token-plan-cn",
+      "label": "primary"
+    },
+    {
+      "key": "tp-your-second-key-here",
+      "provider": "xiaomi-token-plan-cn",
+      "label": "backup"
     }
-  }
+  ]
 }
 ```
 
-### 4. Reload pi
+> The `provider` field must match a pi provider name (e.g. `xiaomi-token-plan-cn`, `anthropic`, `openai-codex`). The extension auto-detects it and configures `models.json`.
+
+### 2. Reload pi
 
 ```
 /reload
 ```
 
-## Commands
+That's it. The extension will:
+- Auto-create `~/.pi/agent/key-pool/` directory on first load
+- Auto-generate `pool-config.json` with defaults
+- Auto-configure `models.json` with the correct provider + `!bash` injection
 
-| Command | Description |
-|---------|-------------|
-| `/pool-status` | View key pool health, current active key, cooldown status, recent debug log |
-| `/pool-reset` | Manually clear all cooldown marks and debug log |
+### 3. Verify
 
-## Config
+```
+/pool-status
+```
 
-### `~/.pi/agent/key-pool/pool-config.json` (optional)
+You should see something like:
+
+```
+Key Pool: 2 keys | #1 active | 0 cooling
+
+  #1  tp-cuc...xxxxx... (primary)  — ◀ active
+  #2  tp-cuq0...xxxxx... (backup)
+
+Retry: 0/3 | Debug: OFF
+Cooldowns: capacity=30s, quota=300s, network=off
+```
+
+## How It Works
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│  keys.json  │────▶│ get-current-key  │────▶│   API Request    │
+│  (key pool) │     │  .sh (!bash)     │     │  (correct key    │
+└─────────────┘     │  reads .key-state │     │   injected)       │
+                   └──────────────────┘     └──────────────────┘
+                            ▲                         │
+                            │                         │
+                   ┌────────┴─────────┐             │
+                   │  .key-state      │◀────────────┘
+                   │  (managed by      │  session_start / turn_end
+                   │   extension)     │
+                   └──────────────────┘
+```
+
+### Lifecycle
+
+```
+/new (new session)
+  ├─ session_start → rotateToNext() → write .key-state
+  └─ Next request → !bash script reads new index → outputs new key ✅
+
+Normal request (same session)
+  └─ !bash script reads same index → outputs same key (cache preserved) ✅
+
+API error (429/529)
+  ├─ turn_end → classify error → mark cooled → rotateToNext()
+  ├─ write .key-state (new index)
+  └─ retryLastUserMessage() → transparent retry with new key ✅
+
+Cooldown expires
+  └─ isCooled() returns false → key becomes eligible again ✅
+```
+
+## Configuration
+
+### `~/.pi/agent/key-pool/pool-config.json` (auto-created)
 
 ```json
 {
@@ -111,75 +146,135 @@ Edit `~/.pi/models.json`:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `cooldownMs.capacity` | `30000` (30s) | Cooldown for overloaded/capacity errors |
-| `cooldownMs.quota` | `300000` (5min) | Cooldown for rate-limit/quota errors |
-| `cooldownMs.network` | `0` (no cooldown) | Network errors don't cool keys down |
-| `maxRetries` | `3` | Max automatic retries before giving up |
-| `retryOnSessionStart` | `true` | Rotate to next key on new session |
-| `debug` | `false` | When `true`, preserves error details in `.key-state` and shows them in `/pool-status` |
+| `cooldownMs.capacity` | `30000` (30s) | Overloaded / 529 errors — usually transient |
+| `cooldownMs.quota` | `300000` (5min) | Rate limit / 429 errors — standard recovery |
+| `cooldownMs.network` | `0` (no cooldown) | Network errors — don't blame the key |
+| `maxRetries` | `3` | Max consecutive retries before giving up |
+| `retryOnSessionStart` | `true` | Rotate key on `/new` |
+| `debug` | `false` | Enable error logging (see below) |
 
-## How It Works
+### `~/.pi/agent/key-pool/keys.json`
 
-```
-session_start → rotateToNext() → pick non-cooled key → write .key-state → notify user
-     ↓
-API request → models.json apiKey = "!bash get-current-key.sh"
-                                   ↓
-                          read .key-state → output active key (skip cooled)
-     ↓
-turn_end → check assistant message for errors
-     ├─ network error   → notify (don't switch, don't cool)
-     ├─ capacity error  → mark cooled(30s) → switch key → retry + notify
-     └→ quota error     → mark cooled(5min) → switch key → retry + notify
-     ↓
-cooldown expires → key becomes eligible again automatically
+```json
+{
+  "keys": [
+    { "key": "sk-or-tp-your-key", "provider": "your-provider", "label": "optional" }
+  ]
+}
 ```
 
-### Error Classification
+| Field | Required | Description |
+|-------|:--------:|-------------|
+| `key` | ✅ | The API key string |
+| `provider` | ✅ | pi provider name (auto-detected, used to configure models.json) |
+| `label` | | Display name in `/pool-status` |
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `/pool-status` | Show pool health, active key, cooldown status, recent debug log |
+| `/pool-reset` | Clear all cooldown marks and debug log |
+
+### Example output (debug mode ON)
+
+```
+Key Pool: 3 keys | #2 active | 1 cooling
+Target: auth.json/xiaomi-token-plan-cn
+
+  #1  tp-cuc...xxxxx... (primary)  — ❄️ quota ~3m
+  #2  tp-cuq0...xxxxx... (backup)  — ◀ active
+  #3  tp-cwzl...xxxxx... (test)    — ✅ quota (recovered)
+
+Retry: 0/3 | Debug: ON
+Cooldowns: capacity=30s, quota=300s, network=off
+
+--- Debug Log ---
+  [14:32:01] #1 [quota] switch→#2: status_code: 429 rate limit exceeded
+  [14:35:22] #2 [capacity] switch→#3: engine overloaded
+```
+
+## Error Classification
 
 | Type | Patterns | Cooldown | Action |
 |------|----------|----------|--------|
-| **capacity** | overloaded, capacity, 529 | 30s | Switch + retry |
-| **quota** | 429, rate limit, too many requests | 5min | Switch + retry |
-| **network** | connection reset, timeout, fetch failed | 0 (none) | Don't switch |
+| **capacity** | `overloaded`, `capacity`, `529` | 30s | Switch + retry |
+| **quota** | `429`, `rate limit`, `too many requests` | 5min | Switch + retry |
+| **network** | `connection reset`, `timeout`, `fetch failed` | 0 (none) | Don't switch |
 | **unknown** | anything else | 0 | Ignore |
 
-### Debug Mode
+Each type has independent cooldown and behavior. Network errors never trigger key switching — they're usually transient infrastructure issues.
 
-When `"debug": true` is set in config:
+## File Structure
 
-- Error details are appended to `.key-state.debugLog[]` (last 50 entries kept)
-- `/pool-status` shows recent error log with timestamps
-- Max-retries notification includes the actual error message
-- Network error notifications include the raw error text
-- `/pool-reset` clears both cooldown marks and debug log
+```
+📦 pi-key-pool/                    # npm package (git repo)
+├── package.json                   # pi.extensions → "./extensions/index.ts"
+├── extensions/
+│   └── index.ts                   # Extension code (~416 lines)
+├── get-current-key.sh             # Shell script template
+├── keys.example.json              # Key pool template
+├── pool-config.example.json       # Config template
+├── .npmignore                     # Exclude runtime data from npm
+└── README.md                      # This file
 
-## Design Decisions (vs alternatives)
+📂 ~/.pi/agent/key-pool/           # Runtime (auto-created)
+├── keys.json                     # Your actual keys
+├── pool-config.json              # Your config (optional)
+├── .key-state                    # Runtime state (auto-managed)
+└── get-current-key.sh            # Deployed shell script
+```
 
-| Feature | pi-key-pool | pi-multi-pass | pi-high-availability |
-|---------|-------------|---------------|---------------------|
+## Design Decisions
+
+### Why not modify auth.json directly?
+
+pi loads `auth.json` **before** extensions are initialized. Writing to auth.json from an extension is too late — the current session would still use the old key.
+
+Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` and outputting the correct key. No timing issues.
+
+### Why session-based rotation (not per-request)?
+
+Per-request rotation would break prompt caching — every request would hit a different key, wasting cache warmth. Session-based rotation gives you:
+- **Cache efficiency**: All requests in a session use the same key → warm cache
+- **Load distribution**: Different sessions use different keys → spread across pool
+- **Predictability**: You know which key is active via `/pool-status`
+
+### Why shell script instead of pure TS?
+
+pi's `models.json` supports `!bash <command>` for dynamic apiKey resolution. This is the official mechanism for runtime key injection. The shell script is minimal (~65 lines), reads JSON state, handles cooldown skipping, and outputs the chosen key.
+
+## vs Alternatives
+
+| Feature | **pi-key-pool** | [pi-multi-pass](https://github.com/hjanuschka/pi-multi-pass) | [pi-high-availability](https://github.com/burggraf/pi-high-availability) |
+|---------|:---:|:---:|:---:|
 | Session rotation | ✅ unique | ❌ | ❌ |
 | Cooldown recovery | ✅ time-based | ✅ 5min fixed | ✅ configurable |
 | Auto-retry | ✅ transparent | ✅ | ✅ |
 | Error classification | ✅ 3-tier | ❌ unified | ✅ 3-tier |
+| Auto provider detect | ✅ from keys.json | ❌ manual | ❌ manual |
 | Debug logging | ✅ opt-in | ❌ | ❌ |
-| Size | ~570 lines | ~17K lines | ~400 lines |
+| Size | **~480 lines** | ~17K lines | ~400 lines |
 | OAuth support | ❌ API keys only | ✅ full lifecycle | ✅ both |
-| TUI management panel | ❌ commands only | ✅ full TUI | ✅ accordion UI |
+| TUI panel | ❌ commands only | ✅ full TUI | ✅ accordion UI |
 
-## Testing
+## Developing
 
 ```bash
-# Test shell script directly
-~/.pi/agent/key-pool/get-current-key.sh
+# Clone
+git clone https://github.com/ssdiwu/pi-key-pool.git
+cd pi-key-pool
 
-# Check pool status (after /reload)
+# Install locally (for testing)
+pi install .
+
+# Test with temporary load (no auto-load)
+pi -e extensions/index.ts --print "hello" --no-session --provider <your-provider>
+
+# Check pool status inside pi
 /pool-status
-
-# Reset all cooldowns
-/pool-reset
 ```
 
 ## License
 
-MIT
+[MIT](LICENSE)

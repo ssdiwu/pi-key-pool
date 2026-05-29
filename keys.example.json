@@ -1,1 +1,1 @@
-{"keys": [{"key": "tp-your-first-api-key-here", "label": "primary"}, {"key": "tp-your-second-api-key-here", "label": "backup"}], "_comment": "key-pool keys.json — one entry per API key. label is optional (shown in /pool-status)"}
+{"keys": [{"key": "tp-or-sk-your-first-api-key-here", "provider": "your-provider-name", "label": "primary"}, {"key": "tp-or-sk-your-second-api-key-here", "provider": "your-provider-name", "label": "backup"}], "_comment": "provider: must match a pi provider name (e.g. xiaomi-token-plan-cn, anthropic)"}
