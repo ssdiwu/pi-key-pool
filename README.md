@@ -11,38 +11,50 @@ API key pool manager for [pi](https://github.com/earendil-works/pi) coding agent
 - **Debug logging** — optional debug mode preserves error details in state file for troubleshooting
 - **Zero-config for basic use** — just drop your keys into the pool
 
-## File Structure
-
-All files live under `~/.pi/agent/key-pool/`:
+## Architecture
 
 ```
-~/.pi/agent/key-pool/
-├── index.ts            # Extension main code
-├── get-current-key.sh  # Shell script (called by models.json apiKey)
-├── api-keys.txt        # Your API key pool (one per line)
-├── pool-config.json    # Optional configuration
-└── .key-state          # Runtime state (auto-managed)
+┌─ Package (loaded by pi via `pi install`) ──────────────────────┐
+│  pi-key-pool/                                                   │
+│  ├── package.json     ← pi.extensions → "./extensions/index.ts" │
+│  ├── extensions/                                                │
+│  │   └── index.ts     ← Extension code (pi loads this)         │
+│  ├── get-current-key.sh   (template, copied on setup)           │
+│  └── pool-config.example.json (template)                        │
+└─────────────────────────────────────────────────────────────────┘
+                          ↓ reads/writes at runtime
+┌─ Runtime data (~/.pi/agent/key-pool/) ─────────────────────────┐
+│  ├── api-keys.txt        ← Your API keys (one per line)        │
+│  ├── pool-config.json    ← Configuration (optional)            │
+│  ├── .key-state          ← Runtime state (auto-managed)        │
+│  └── get-current-key.sh  ← Shell script (models.json → apiKey) │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Install
 
 ```bash
-# Clone or download to your preferred location
-git clone https://github.com/yourname/pi-key-pool.git
+# Install from local path
+pi install /path/to/pi-key-pool
 
-# Copy extension to pi's agent directory
-mkdir -p ~/.pi/agent/key-pool
-cp pi-key-pool/extensions/index.ts       ~/.pi/agent/key-pool/index.ts
-cp pi-key-pool/get-current-key.sh         ~/.pi/agent/key-pool/get-current-key.sh
-chmod +x ~/.pi/agent/key-pool/get-current-key.sh
-
-# Create config (optional, has sensible defaults)
-cp pi-key-pool/pool-config.example.json  ~/.pi/agent/key-pool/pool-config.json
+# Or from git (when published)
+pi install git:github.com/yourname/pi-key-pool
 ```
 
-## Quick Start
+## Setup
 
-1. Add your API keys (one per line) to `~/.pi/agent/key-pool/api-keys.txt`:
+### 1. Create runtime directory and copy templates
+
+```bash
+mkdir -p ~/.pi/agent/key-pool
+cp pi-key-pool/get-current-key.sh ~/.pi/agent/key-pool/
+chmod +x ~/.pi/agent/key-pool/get-current-key.sh
+cp pi-key-pool/pool-config.example.json ~/.pi/agent/key-pool/pool-config.json
+```
+
+### 2. Add your API keys
+
+Edit `~/.pi/agent/key-pool/api-keys.txt`:
 
 ```
 # Comments with # are ignored
@@ -51,7 +63,9 @@ tp-your-second-key-here
 tp-your-third-key-here
 ```
 
-2. Configure `~/.pi/models.json` to use the key pool:
+### 3. Configure models.json
+
+Edit `~/.pi/models.json`:
 
 ```json
 {
@@ -65,7 +79,11 @@ tp-your-third-key-here
 }
 ```
 
-3. Restart pi (or `/reload`)
+### 4. Reload pi
+
+```
+/reload
+```
 
 ## Commands
 
@@ -75,9 +93,6 @@ tp-your-third-key-here
 | `/pool-reset` | Manually clear all cooldown marks and debug log |
 
 ## Config
-
-### `~/.pi/agent/key-pool/api-keys.txt`
-One API key per line. Lines starting with `#` are comments.
 
 ### `~/.pi/agent/key-pool/pool-config.json` (optional)
 
@@ -106,14 +121,16 @@ One API key per line. Lines starting with `#` are comments.
 ## How It Works
 
 ```
-session_start → rotateToNext() → pick non-cooled key → notify user
+session_start → rotateToNext() → pick non-cooled key → write .key-state → notify user
      ↓
-API request → !bash get-current-key.sh → read .key-state → output active key
+API request → models.json apiKey = "!bash get-current-key.sh"
+                                   ↓
+                          read .key-state → output active key (skip cooled)
      ↓
 turn_end → check assistant message for errors
-     ├─ network error   → retry same key immediately (no cooldown)
-     ├─ capacity error  → mark cooled(30s) → switch key → retry
-     └─ quota error     → mark cooled(5min) → switch key → retry
+     ├─ network error   → notify (don't switch, don't cool)
+     ├─ capacity error  → mark cooled(30s) → switch key → retry + notify
+     └→ quota error     → mark cooled(5min) → switch key → retry + notify
      ↓
 cooldown expires → key becomes eligible again automatically
 ```
@@ -124,7 +141,7 @@ cooldown expires → key becomes eligible again automatically
 |------|----------|----------|--------|
 | **capacity** | overloaded, capacity, 529 | 30s | Switch + retry |
 | **quota** | 429, rate limit, too many requests | 5min | Switch + retry |
-| **network** | connection reset, timeout, fetch failed | 0 (none) | Don't switch, let pi handle |
+| **network** | connection reset, timeout, fetch failed | 0 (none) | Don't switch |
 | **unknown** | anything else | 0 | Ignore |
 
 ### Debug Mode
@@ -146,7 +163,7 @@ When `"debug": true` is set in config:
 | Auto-retry | ✅ transparent | ✅ | ✅ |
 | Error classification | ✅ 3-tier | ❌ unified | ✅ 3-tier |
 | Debug logging | ✅ opt-in | ❌ | ❌ |
-| Size | ~550 lines | ~17K lines | ~400 lines |
+| Size | ~570 lines | ~17K lines | ~400 lines |
 | OAuth support | ❌ API keys only | ✅ full lifecycle | ✅ both |
 | TUI management panel | ❌ commands only | ✅ full TUI | ✅ accordion UI |
 
@@ -156,7 +173,7 @@ When `"debug": true` is set in config:
 # Test shell script directly
 ~/.pi/agent/key-pool/get-current-key.sh
 
-# Check pool status (after loading extension)
+# Check pool status (after /reload)
 /pool-status
 
 # Reset all cooldowns
