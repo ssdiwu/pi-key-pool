@@ -29,9 +29,24 @@
 - `package.json`
 - `pool-config.example.json`
 
-## 待发布修补：0.2.2
+## 已发布：0.2.2
 
-- 目的：
-  - 排除本地 `*.tgz` 产物，避免再次进入 npm tarball
-  - 修正 `package.json` 的 `repository.url`，消除 publish warning
-- 状态：已完成代码修改，待发布
+- 包名：`pi-key-pool`
+- 版本：`0.2.2`
+- 产物：`pi-key-pool-0.2.2.tgz`
+
+### 修补目标
+
+- 排除本地 `*.tgz` 产物，避免再次进入 npm tarball
+- 修正 `package.json` 的 `repository.url`，消除 publish warning
+
+### 校验信息
+
+- shasum: `6dbd7aa95e8fb94425a981857cdb536ca0c30972`
+- integrity: `sha512-ekso8dEHzy6xt[...]JsXm2oM914tyA==`
+
+### 发布结果
+
+- tag: `latest`
+- access: 默认公开
+- tarball files: `7`
