@@ -4,7 +4,7 @@
  * 核心能力：
  *   1. Session 绑定   — 每个 session 独占一个 key，完全隔离
  *   2. 冷却恢复       — 失败 key 带时间戳标记，到期自动恢复
- *   3. 自动重试       — 切换 key 后自动重发上一条用户消息（用户无感）
+ *   3. 自动重试       — 切换 key 后自动重发上一条用户消息，并在连续 429 时熔断
  *   4. 错误分类       — capacity / quota / network 三类独立策略
  *   5. 僵尸清理       — 启动时清理超时的 assignments
  */
@@ -173,10 +173,30 @@ try:
     if idx is None and isinstance(state.get("index"), int):
         idx = state["index"]
 
-    if idx is None or idx < 0 or idx >= len(keys) or is_cooled(idx):
-        idx = next((i for i in range(len(keys)) if not is_cooled(i)), 0)
+    available = [i for i in range(len(keys)) if not is_cooled(i)]
+    if not available:
+        remaining = []
+        now = time.time() * 1000
+        for entry in cooled.values():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                left = float(entry["cooldownMs"]) - (now - float(entry["exhaustedAt"]))
+                if left > 0:
+                    remaining.append(left)
+            except Exception:
+                pass
+        wait = ""
+        if remaining:
+            secs = int((min(remaining) + 999) // 1000)
+            wait = f"; next key available in {secs}s" if secs < 60 else f"; next key available in ~{(secs + 59) // 60}m"
+        print(f"ERROR: all keys are cooling{wait}", file=sys.stderr)
+        sys.exit(2)
 
-    print(keys[idx % len(keys)])
+    if idx is None or idx < 0 or idx >= len(keys) or is_cooled(idx):
+        idx = available[0]
+
+    print(keys[idx])
 except Exception as ex:
     print(f"ERROR: {ex}", file=sys.stderr)
     sys.exit(1)
@@ -210,7 +230,7 @@ function normalizeConfig(input: unknown): PoolConfig {
 			quota: numberOr(cooldownMs.quota, DEFAULT_CONFIG.cooldownMs.quota),
 			network: numberOr(cooldownMs.network, DEFAULT_CONFIG.cooldownMs.network),
 		},
-		maxRetries: numberOr(raw.maxRetries, DEFAULT_CONFIG.maxRetries, 1),
+		maxRetries: numberOr(raw.maxRetries, DEFAULT_CONFIG.maxRetries, 0),
 		assignmentTtlMs: numberOr(raw.assignmentTtlMs, DEFAULT_CONFIG.assignmentTtlMs, 1_000),
 		debug: raw.debug === true,
 	};
@@ -370,6 +390,12 @@ function formatCooldown(ms: number): string {
 	if (ms <= 0) return "";
 	const secs = Math.ceil(ms / 1000);
 	return secs < 60 ? `${secs}s` : `~${Math.ceil(secs / 60)}m`;
+}
+
+function nextRecoveryText(state: KeyState): string {
+	const waits = Object.values(state.cooled).map((entry) => remainingCooldown(entry)).filter((ms) => ms > 0);
+	if (waits.length === 0) return "";
+	return `; next key available in ${formatCooldown(Math.min(...waits))}`;
 }
 
 function appendDebugLog(state: KeyState, ki: number, sid: string, et: ErrorType, msg: string, action: string): void {
@@ -551,7 +577,8 @@ export default function (pi: ExtensionAPI) {
 			const label = keys[keyIndex].label ? ` (${keys[keyIndex].label})` : "";
 			ctx.ui.notify(`key-pool: session ${currentSessionId.slice(0, 8)}... → key #${keyIndex + 1}${label}`, "info");
 		} else {
-			ctx.ui.notify("key-pool: no available key (all keys are cooling)", "error");
+			const recovery = nextRecoveryText(loadState());
+			ctx.ui.notify(`key-pool: no available key (all keys are cooling${recovery})`, "error");
 		}
 	});
 
@@ -579,16 +606,6 @@ export default function (pi: ExtensionAPI) {
 		const retryCount = getRetryCount(state, currentSessionId);
 		const errMsg = msg.errorMessage ?? "unknown";
 
-		if (retryCount >= cfg.maxRetries) {
-			ctx.ui.notify(`❌ key-pool: max retries (${cfg.maxRetries}) reached.${cfg.debug ? ` ${redactSensitive(errMsg).slice(0, 120)}` : ""}`, "error");
-			updateState((s) => {
-				if (cfg.debug) appendDebugLog(s, s.assignments[currentSessionId!]?.keyIndex ?? -1, currentSessionId!, "unknown", errMsg, "max-retries");
-				if (s.retryCounts) delete s.retryCounts[currentSessionId!];
-				s.retryCount = 0;
-			});
-			return;
-		}
-
 		const classification = classifyError(errMsg);
 		if (!classification.shouldSwitch) {
 			if (classification.type === "network") ctx.ui.notify(`⚡ key-pool: network error (not switching)${cfg.debug ? `: ${redactSensitive(errMsg).slice(0, 80)}` : ""}`, "info");
@@ -596,17 +613,33 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		const result = switchSessionKeyAfterError(currentSessionId, classification.type, errMsg, cfg.debug);
+		const attempt = retryCount + 1;
+		const errorPreview = redactSensitive(errMsg).slice(0, 80);
+
 		if (result.newKeyIndex < 0) {
-			ctx.ui.notify("❌ key-pool: all keys are cooling; retry skipped", "error");
+			const recovery = nextRecoveryText(loadState());
+			ctx.ui.notify(`❌ key-pool: all keys are cooling${recovery}; auto retry stopped`, "error");
+			resetRetryCount(currentSessionId);
 			return;
 		}
 
-		const errorPreview = redactSensitive(errMsg).slice(0, 80);
 		pi.sendMessage({
 			customType: "key-pool",
 			content: `⚠️ #${result.oldKeyIndex + 1} [${classification.type}] ${errorPreview}\n   → #${result.newKeyIndex + 1}`,
 			display: true,
 		}, { deliverAs: "followUp" });
+
+		if (attempt > cfg.maxRetries) {
+			ctx.ui.notify(`❌ key-pool: max retries (${cfg.maxRetries}) reached; auto retry stopped`, "error");
+			resetRetryCount(currentSessionId);
+			return;
+		}
+
+		if (classification.type === "quota" && retryCount > 0) {
+			ctx.ui.notify(`⏸️ key-pool: consecutive 429/quota errors; auto retry stopped. Current session switched to key #${result.newKeyIndex + 1}`, "warning");
+			resetRetryCount(currentSessionId);
+			return;
+		}
 
 		retryLastUserMessage(ctx);
 	});

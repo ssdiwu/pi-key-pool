@@ -11,6 +11,7 @@ When you have multiple API keys and want to:
 - **Distribute load** across keys — each new conversation uses a different key
 - **Auto-recover** from transient errors — failed keys cool down and come back automatically
 - **Retry transparently** — when a key fails, switch to the next one and retry without user intervention
+- **Stop retry loops** — consecutive 429/quota errors stop automatic re-send instead of repeating the same user message
 - **Debug easily** — see exactly what happened when things go wrong
 
 ## Features
@@ -19,7 +20,7 @@ When you have multiple API keys and want to:
 |---------|-------------|
 | **Session-based binding** | Each session is bound to a unique key — parallel sessions use different keys automatically |
 | **Cooldown recovery** | Failed keys enter timed cooldown, auto-recover when expired. No manual reset needed |
-| **Smart retry** | On quota/capacity error → switch key → auto-retry last message. User sees nothing |
+| **Smart retry + breaker** | On quota/capacity error → switch key → auto-retry last message; consecutive 429/quota errors stop auto-retry and show cooldown wait |
 | **Error classification** | 3 tiers: `capacity` (30s) / `quota` (5min) / `network` (no switch). Independent strategy per type |
 | **Zombie cleanup** | Auto-clean stale session bindings on startup (TTL: 1 hour) |
 | **Auto provider detection** | Reads `provider` field from `keys.json`, auto-configures `models.json`. No hardcoded providers |
@@ -128,7 +129,8 @@ Parallel sessions
 API error (429/529)
   ├─ turn_end → classify error → mark cooled → reassign
   ├─ write .key-state (new assignment)
-  └─ retryLastUserMessage() → transparent retry with new key ✅
+  ├─ first quota/capacity failure → retryLastUserMessage() ✅
+  └─ consecutive 429 or all keys cooling → stop auto-retry and show wait time ✅
 
 Session ends (/new, /resume, exit)
   ├─ session_shutdown → releaseSessionAssignment()
@@ -160,7 +162,7 @@ Cooldown expires
 | `cooldownMs.capacity` | `30000` (30s) | Overloaded / 529 errors — usually transient |
 | `cooldownMs.quota` | `300000` (5min) | Rate limit / 429 errors — standard recovery |
 | `cooldownMs.network` | `0` (no cooldown) | Network errors — don't blame the key |
-| `maxRetries` | `3` | Max consecutive retries before giving up |
+| `maxRetries` | `3` | Max consecutive automatic retries before giving up. Set to `0` to switch keys without auto-sending the last user message |
 | `assignmentTtlMs` | `3600000` (1h) | TTL for stale session assignments (zombie cleanup) |
 | `debug` | `false` | Enable error logging (see below) |
 
@@ -213,7 +215,7 @@ Assignment TTL: 60min
 | Type | Patterns | Cooldown | Action |
 |------|----------|----------|--------|
 | **capacity** | `overloaded`, `capacity`, `529` | 30s | Switch + retry |
-| **quota** | `429`, `rate limit`, `too many requests` | 5min | Switch + retry |
+| **quota** | `429`, `rate limit`, `too many requests` | 5min | Switch + retry once; consecutive quota errors stop auto-retry |
 | **network** | `connection reset`, `timeout`, `fetch failed` | 0 (none) | Don't switch |
 | **unknown** | anything else | 0 | Ignore |
 
