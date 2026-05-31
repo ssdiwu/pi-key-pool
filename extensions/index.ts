@@ -7,32 +7,36 @@
  *   3. 自动重试       — 切换 key 后自动重发上一条用户消息（用户无感）
  *   4. 错误分类       — capacity / quota / network 三类独立策略
  *   5. 僵尸清理       — 启动时清理超时的 assignments
- *
- * 架构：
- *   models.json apiKey = "!bash get-current-key.sh"
- *     → 每次请求执行脚本 → 读 .current-session + .key-state → 输出当前 key
- *   extension 管理 .key-state（assignments / cooldown）
- *
- * 运行时数据（~/.pi/agent/key-pool/）：
- *   keys.json           — key 池
- *   pool-config.json    — 配置
- *   .key-state          — 状态（extension 维护）
- *   .current-session    — 当前 sessionId（供 get-current-key.sh 读取）
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	mkdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 // ── 路径常量 ────────────────────────────────────────────────
 
-const HOME = process.env.HOME || "";
+const HOME = process.env.HOME || homedir();
 const AGENT_DIR = join(HOME, ".pi", "agent", "key-pool");
 const KEYS_FILE = join(AGENT_DIR, "keys.json");
 const STATE_FILE = join(AGENT_DIR, ".key-state");
+const LOCK_DIR = join(AGENT_DIR, ".key-state.lock");
 const CONFIG_FILE = join(AGENT_DIR, "pool-config.json");
 const SESSION_FILE = join(AGENT_DIR, ".current-session");
+const SCRIPT_FILE = join(AGENT_DIR, "get-current-key.sh");
+const MODELS_FILE = join(HOME, ".pi", "models.json");
 
 // ── 类型定义 ─────────────────────────────────────────────────
 
@@ -50,7 +54,9 @@ interface Assignment {
 interface KeyState {
 	assignments: Record<string, Assignment>;
 	cooled: Record<string, CooldownEntry>;
+	/** legacy global counter, kept for migration */
 	retryCount: number;
+	retryCounts?: Record<string, number>;
 	debugLog?: DebugEntry[];
 }
 
@@ -84,14 +90,156 @@ interface PoolConfig {
 	debug: boolean;
 }
 
-// ── 默认配置 ─────────────────────────────────────────────────
-
 const DEFAULT_CONFIG: PoolConfig = {
 	cooldownMs: { capacity: 30_000, quota: 300_000, network: 0 },
 	maxRetries: 3,
-	assignmentTtlMs: 3600_000, // 1 小时
+	assignmentTtlMs: 3600_000,
 	debug: false,
 };
+
+// ── Shell 脚本（安装时部署到运行目录）─────────────────────────
+
+const GET_CURRENT_KEY_SCRIPT = `#!/bin/bash
+# 读取 ~/.pi/agent/key-pool/ 状态，输出当前 session 应使用的 API key。
+# 优先使用 PI_KEY_POOL_SESSION_ID，fallback 到 .current-session。
+
+set -euo pipefail
+
+AGENT_DIR="\${PI_KEY_POOL_DIR:-$HOME/.pi/agent/key-pool}"
+export KEYS_FILE="\${AGENT_DIR}/keys.json"
+export STATE_FILE="\${AGENT_DIR}/.key-state"
+export SESSION_FILE="\${AGENT_DIR}/.current-session"
+
+python3 <<'PY'
+import json
+import os
+import sys
+import time
+
+keys_file = os.environ["KEYS_FILE"]
+state_file = os.environ["STATE_FILE"]
+session_file = os.environ["SESSION_FILE"]
+
+try:
+    with open(keys_file, encoding="utf-8") as f:
+        data = json.load(f)
+    arr = data if isinstance(data, list) else data.get("keys", [])
+    keys = []
+    for item in arr:
+        if isinstance(item, dict):
+            key = item.get("key")
+        else:
+            key = item
+        if isinstance(key, str) and key.strip():
+            keys.append(key.strip())
+
+    if not keys:
+        print(f"ERROR: no keys in {keys_file}", file=sys.stderr)
+        sys.exit(1)
+
+    state = {}
+    try:
+        with open(state_file, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        state = {}
+
+    session_id = os.environ.get("PI_KEY_POOL_SESSION_ID")
+    if not session_id:
+        try:
+            with open(session_file, encoding="utf-8") as f:
+                session_id = f.read().strip() or None
+        except FileNotFoundError:
+            session_id = None
+
+    cooled = state.get("cooled", {}) if isinstance(state, dict) else {}
+
+    def is_cooled(index):
+        entry = cooled.get(str(index))
+        if not isinstance(entry, dict):
+            return False
+        try:
+            return time.time() * 1000 - float(entry["exhaustedAt"]) < float(entry["cooldownMs"])
+        except Exception:
+            return False
+
+    idx = None
+    assignments = state.get("assignments", {}) if isinstance(state, dict) else {}
+    if session_id and isinstance(assignments, dict):
+        assignment = assignments.get(session_id)
+        if isinstance(assignment, dict) and isinstance(assignment.get("keyIndex"), int):
+            idx = assignment["keyIndex"]
+
+    if idx is None and isinstance(state.get("index"), int):
+        idx = state["index"]
+
+    if idx is None or idx < 0 or idx >= len(keys) or is_cooled(idx):
+        idx = next((i for i in range(len(keys)) if not is_cooled(i)), 0)
+
+    print(keys[idx % len(keys)])
+except Exception as ex:
+    print(f"ERROR: {ex}", file=sys.stderr)
+    sys.exit(1)
+PY
+`;
+
+// ── 通用工具 ─────────────────────────────────────────────────
+
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function secureFile(path: string, mode: number): void {
+	try { chmodSync(path, mode); } catch { /* ignore */ }
+}
+
+function shellQuote(value: string): string {
+	return "'" + value.replace(/'/g, "'\\''") + "'";
+}
+
+function numberOr(value: unknown, fallback: number, min = 0): number {
+	return typeof value === "number" && Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+function normalizeConfig(input: unknown): PoolConfig {
+	const raw = input && typeof input === "object" ? input as Record<string, any> : {};
+	const cooldownMs = raw.cooldownMs && typeof raw.cooldownMs === "object" ? raw.cooldownMs : {};
+	return {
+		cooldownMs: {
+			capacity: numberOr(cooldownMs.capacity, DEFAULT_CONFIG.cooldownMs.capacity),
+			quota: numberOr(cooldownMs.quota, DEFAULT_CONFIG.cooldownMs.quota),
+			network: numberOr(cooldownMs.network, DEFAULT_CONFIG.cooldownMs.network),
+		},
+		maxRetries: numberOr(raw.maxRetries, DEFAULT_CONFIG.maxRetries, 1),
+		assignmentTtlMs: numberOr(raw.assignmentTtlMs, DEFAULT_CONFIG.assignmentTtlMs, 1_000),
+		debug: raw.debug === true,
+	};
+}
+
+function withStateLock<T>(fn: () => T): T {
+	const startedAt = Date.now();
+	let acquired = false;
+	while (!acquired) {
+		try {
+			mkdirSync(LOCK_DIR);
+			writeFileSync(join(LOCK_DIR, "owner"), `${process.pid}:${Date.now()}`, "utf-8");
+			acquired = true;
+		} catch (error: any) {
+			if (error?.code !== "EEXIST") throw error;
+			try {
+				if (Date.now() - statSync(LOCK_DIR).mtimeMs > 10_000) rmSync(LOCK_DIR, { recursive: true, force: true });
+			} catch { /* ignore stale-lock cleanup errors */ }
+			if (Date.now() - startedAt > 5_000) throw new Error("key-pool: timed out waiting for state lock");
+			sleepSync(25);
+		}
+	}
+
+	try {
+		return fn();
+	} finally {
+		rmSync(LOCK_DIR, { recursive: true, force: true });
+	}
+}
 
 // ── 文件读写 ─────────────────────────────────────────────────
 
@@ -99,64 +247,61 @@ function loadConfig(): PoolConfig {
 	try {
 		if (!existsSync(CONFIG_FILE)) return DEFAULT_CONFIG;
 		const raw = readFileSync(CONFIG_FILE, "utf-8").trim();
-		if (!raw) return DEFAULT_CONFIG;
-		return { ...DEFAULT_CONFIG, ...JSON.parse(raw) };
+		return raw ? normalizeConfig(JSON.parse(raw)) : DEFAULT_CONFIG;
 	} catch { return DEFAULT_CONFIG; }
 }
 
-/**
- * 检测并补充缺失的配置字段
- * 保留用户已有的值，只添加新字段的默认值
- */
+function writeConfig(config: PoolConfig): void {
+	writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
+	secureFile(CONFIG_FILE, 0o600);
+}
+
 function migrateConfig(): void {
 	try {
 		if (!existsSync(CONFIG_FILE)) return;
 		const raw = readFileSync(CONFIG_FILE, "utf-8").trim();
 		if (!raw) return;
-		
 		const existing = JSON.parse(raw);
-		const merged = { ...DEFAULT_CONFIG, ...existing };
-		
-		// 检测是否有新增字段
-		const hasNewFields = Object.keys(DEFAULT_CONFIG).some(
-			(key) => !(key in existing)
-		);
-		
-		if (hasNewFields) {
-			writeFileSync(CONFIG_FILE, JSON.stringify(merged, null, 2), "utf-8");
-		}
-	} catch {
-		// 静默失败，不影响启动
-	}
+		const normalized = normalizeConfig(existing);
+		if (JSON.stringify(existing) !== JSON.stringify(normalized)) writeConfig(normalized);
+	} catch { /* keep startup non-blocking */ }
 }
 
-function loadState(): KeyState {
+function freshState(): KeyState {
+	return { assignments: {}, cooled: {}, retryCount: 0, retryCounts: {} };
+}
+
+function loadStateUnlocked(): KeyState {
 	try {
 		if (!existsSync(STATE_FILE)) return freshState();
 		const raw = readFileSync(STATE_FILE, "utf-8").trim();
 		if (!raw) return freshState();
 		const parsed = JSON.parse(raw);
-		
-		// 兼容旧格式：如果没有 assignments，从 index 迁移
 		if (!parsed.assignments && typeof parsed.index === "number") {
-			return {
-				assignments: {},
-				cooled: parsed.cooled || {},
-				retryCount: parsed.retryCount || 0,
-				debugLog: parsed.debugLog,
-			};
+			return { assignments: {}, cooled: parsed.cooled || {}, retryCount: parsed.retryCount || 0, retryCounts: {}, debugLog: parsed.debugLog };
 		}
-		
-		return { ...freshState(), ...parsed };
+		return { ...freshState(), ...parsed, retryCounts: parsed.retryCounts || {} };
 	} catch { return freshState(); }
 }
 
-function saveState(state: KeyState) {
-	writeFileSync(STATE_FILE, JSON.stringify(state), "utf-8");
+function saveStateUnlocked(state: KeyState): void {
+	const tmp = `${STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
+	writeFileSync(tmp, JSON.stringify(state), { encoding: "utf-8", mode: 0o600 });
+	renameSync(tmp, STATE_FILE);
+	secureFile(STATE_FILE, 0o600);
 }
 
-function freshState(): KeyState {
-	return { assignments: {}, cooled: {}, retryCount: 0 };
+function loadState(): KeyState {
+	return withStateLock(() => loadStateUnlocked());
+}
+
+function updateState<T>(mutator: (state: KeyState) => T): T {
+	return withStateLock(() => {
+		const state = loadStateUnlocked();
+		const result = mutator(state);
+		saveStateUnlocked(state);
+		return result;
+	});
 }
 
 function readKeys(): KeyEntry[] {
@@ -166,25 +311,26 @@ function readKeys(): KeyEntry[] {
 		if (!raw) return [];
 		const parsed = JSON.parse(raw);
 		const arr = Array.isArray(parsed) ? parsed : parsed.keys ?? [];
-		return arr.filter((e: any) => e && typeof e.key === "string");
+		return arr
+			.filter((e: any) => e && typeof e.key === "string" && e.key.trim().length > 0)
+			.map((e: any) => ({ ...e, key: e.key.trim() }));
 	} catch { return []; }
 }
 
-function readSessionId(): string | null {
-	try {
-		if (!existsSync(SESSION_FILE)) return null;
-		return readFileSync(SESSION_FILE, "utf-8").trim() || null;
-	} catch { return null; }
+function writeSessionId(sessionId: string): void {
+	writeFileSync(SESSION_FILE, sessionId, { encoding: "utf-8", mode: 0o600 });
+	secureFile(SESSION_FILE, 0o600);
 }
 
-function writeSessionId(sessionId: string) {
-	writeFileSync(SESSION_FILE, sessionId, "utf-8");
-}
-
-function removeSessionFile() {
+function removeSessionFile(sessionId: string): void {
 	try {
-		if (existsSync(SESSION_FILE)) unlinkSync(SESSION_FILE);
+		if (existsSync(SESSION_FILE) && readFileSync(SESSION_FILE, "utf-8").trim() === sessionId) unlinkSync(SESSION_FILE);
 	} catch { /* ignore */ }
+}
+
+function deployGetCurrentKeyScript(): void {
+	writeFileSync(SCRIPT_FILE, GET_CURRENT_KEY_SCRIPT, { encoding: "utf-8", mode: 0o700 });
+	secureFile(SCRIPT_FILE, 0o700);
 }
 
 // ── 错误分类 ─────────────────────────────────────────────────
@@ -193,21 +339,17 @@ function classifyError(msg?: string): ErrorClassification {
 	if (!msg) return { type: "unknown", shouldSwitch: false };
 	const lower = msg.toLowerCase();
 
+	const CAPACITY_PATTERNS = [/status_code:? *529/i, /\b529\b/i, /capacity/i, /no capacity/i, /engine overloaded/i, /overloaded/i];
+	if (CAPACITY_PATTERNS.some((p) => p.test(lower))) return { type: "capacity", shouldSwitch: true };
+
+	const QUOTA_PATTERNS = [/status_code:? *429/i, /\b429\b/i, /rate.?limit/i, /too many requests/i, /insufficient quota/i];
+	if (QUOTA_PATTERNS.some((p) => p.test(lower))) return { type: "quota", shouldSwitch: true };
+
 	const NETWORK_PATTERNS = [
-		/internal network failure/i, /api_error/i, /network failure/i,
-		/connection reset/i, /connection refused/i, /etimedout/i,
-		/econnreset/i, /econnrefused/i, /socket hang up/i, /fetch failed/i,
+		/internal network failure/i, /network failure/i, /connection reset/i, /connection refused/i,
+		/etimedout/i, /econnreset/i, /econnrefused/i, /socket hang up/i, /fetch failed/i, /timeout/i,
 	];
-	if (NETWORK_PATTERNS.some((p) => p.test(lower)))
-		return { type: "network", shouldSwitch: false };
-
-	const CAPACITY_PATTERNS = [/capacity/i, /no capacity/i, /engine overloaded/i, /overloaded/i, /status_code:? *529/i];
-	if (CAPACITY_PATTERNS.some((p) => p.test(lower)))
-		return { type: "capacity", shouldSwitch: true };
-
-	const QUOTA_PATTERNS = [/status_code:? *429/i, /rate.?limit/i, /too many requests/i, /insufficient quota/i];
-	if (QUOTA_PATTERNS.some((p) => p.test(lower)))
-		return { type: "quota", shouldSwitch: true };
+	if (NETWORK_PATTERNS.some((p) => p.test(lower))) return { type: "network", shouldSwitch: false };
 
 	return { type: "unknown", shouldSwitch: false };
 }
@@ -230,22 +372,27 @@ function formatCooldown(ms: number): string {
 	return secs < 60 ? `${secs}s` : `~${Math.ceil(secs / 60)}m`;
 }
 
-// ── Debug 日志 ───────────────────────────────────────────────
-
 function appendDebugLog(state: KeyState, ki: number, sid: string, et: ErrorType, msg: string, action: string): void {
 	if (!state.debugLog) state.debugLog = [];
-	state.debugLog.push({ 
-		timestamp: Date.now(), 
-		keyIndex: ki, 
-		sessionId: sid.slice(0, 8), 
-		errorType: et, 
-		errorMessage: msg.slice(0, 500), 
-		action 
+	state.debugLog.push({
+		timestamp: Date.now(),
+		keyIndex: ki,
+		sessionId: sid.slice(0, 8),
+		errorType: et,
+		errorMessage: redactSensitive(msg).slice(0, 500),
+		action,
 	});
 	if (state.debugLog.length > 50) state.debugLog = state.debugLog.slice(-50);
 }
 
-// ── 僵尸清理 ─────────────────────────────────────────────────
+function redactSensitive(text: string): string {
+	return text.replace(/\b(?:sk|tp|ak)-[A-Za-z0-9_-]{8,}\b/g, (m) => `${m.slice(0, 4)}…${m.slice(-4)}`);
+}
+
+function maskKey(key: string): string {
+	if (key.length <= 10) return "****";
+	return `${key.slice(0, 6)}...${key.slice(-4)}`;
+}
 
 function cleanupStaleAssignments(state: KeyState, ttlMs: number): number {
 	const now = Date.now();
@@ -253,6 +400,7 @@ function cleanupStaleAssignments(state: KeyState, ttlMs: number): number {
 	for (const [sid, assignment] of Object.entries(state.assignments)) {
 		if (now - assignment.since > ttlMs) {
 			delete state.assignments[sid];
+			delete state.retryCounts?.[sid];
 			cleaned++;
 		}
 	}
@@ -261,91 +409,77 @@ function cleanupStaleAssignments(state: KeyState, ttlMs: number): number {
 
 // ── 核心：分配 key 给 session ────────────────────────────────
 
+function chooseAvailableKey(state: KeyState, total: number): number {
+	const assignedIndexes = new Set(Object.values(state.assignments).map((a) => a.keyIndex));
+	for (let candidate = 0; candidate < total; candidate++) {
+		if (!assignedIndexes.has(candidate) && !isCooled(state.cooled[String(candidate)])) return candidate;
+	}
+	for (let candidate = 0; candidate < total; candidate++) {
+		if (!isCooled(state.cooled[String(candidate)])) return candidate;
+	}
+	return -1;
+}
+
 function assignKeyToSession(sessionId: string): number {
 	const keys = readKeys();
-	const state = loadState();
 	const config = loadConfig();
-	const total = keys.length;
-	if (total === 0) return -1;
+	if (keys.length === 0) return -1;
 
-	// 清理僵尸 assignments
-	const cleaned = cleanupStaleAssignments(state, config.assignmentTtlMs);
-	if (cleaned > 0) {
-		saveState(state);
-	}
+	return updateState((state) => {
+		cleanupStaleAssignments(state, config.assignmentTtlMs);
+		const existing = state.assignments[sessionId];
+		if (existing && !isCooled(state.cooled[String(existing.keyIndex)])) return existing.keyIndex;
 
-	// 已分配的 key indexes
-	const assignedIndexes = new Set(
-		Object.values(state.assignments).map((a) => a.keyIndex)
-	);
-
-	// 找到未被占用且未冷却的 key
-	for (let offset = 0; offset < total; offset++) {
-		const candidate = offset % total;
-		if (assignedIndexes.has(candidate)) continue;
-		if (isCooled(state.cooled[String(candidate)])) continue;
-		
-		// 找到空闲 key，分配
-		state.assignments[sessionId] = { keyIndex: candidate, since: Date.now() };
-		saveState(state);
-		return candidate;
-	}
-
-	// 所有 key 都被占用或冷却，找最早释放的
-	let earliestIdx = 0;
-	let earliestTime = Infinity;
-	for (let i = 0; i < total; i++) {
-		if (assignedIndexes.has(i)) {
-			// 被占用，看什么时候分配的
-			const assignment = Object.values(state.assignments).find((a) => a.keyIndex === i);
-			if (assignment && assignment.since < earliestTime) {
-				earliestTime = assignment.since;
-				earliestIdx = i;
-			}
-		} else {
-			// 冷却中，看什么时候恢复
-			const cd = state.cooled[String(i)];
-			const recoverAt = cd ? cd.exhaustedAt + cd.cooldownMs : 0;
-			if (recoverAt < earliestTime) {
-				earliestTime = recoverAt;
-				earliestIdx = i;
-			}
-		}
-	}
-
-	// 强制分配（可能会让另一个 session 失效，但避免死锁）
-	state.assignments[sessionId] = { keyIndex: earliestIdx, since: Date.now() };
-	saveState(state);
-	return earliestIdx;
+		const keyIndex = chooseAvailableKey(state, keys.length);
+		if (keyIndex < 0) return -1;
+		state.assignments[sessionId] = { keyIndex, since: Date.now() };
+		return keyIndex;
+	});
 }
 
 function releaseSessionAssignment(sessionId: string): void {
-	const state = loadState();
-	if (state.assignments[sessionId]) {
+	updateState((state) => {
 		delete state.assignments[sessionId];
-		saveState(state);
-	}
+		delete state.retryCounts?.[sessionId];
+	});
 }
 
-function markSessionKeyCooled(sessionId: string, reason: ErrorType): void {
-	const state = loadState();
+function switchSessionKeyAfterError(sessionId: string, reason: ErrorType, debugMessage: string, debugEnabled: boolean): { oldKeyIndex: number; newKeyIndex: number } {
+	const keys = readKeys();
 	const config = loadConfig();
-	const assignment = state.assignments[sessionId];
-	if (!assignment) return;
+	return updateState((state) => {
+		const assignment = state.assignments[sessionId];
+		const oldKeyIndex = assignment?.keyIndex ?? -1;
+		if (assignment) {
+			const cooldownMs = reason === "capacity" ? config.cooldownMs.capacity : reason === "quota" ? config.cooldownMs.quota : config.cooldownMs.network;
+			if (cooldownMs > 0) state.cooled[String(assignment.keyIndex)] = { exhaustedAt: Date.now(), cooldownMs, reason };
+			delete state.assignments[sessionId];
+		}
 
-	const cd =
-		reason === "capacity" ? config.cooldownMs.capacity
-		: reason === "quota" ? config.cooldownMs.quota
-		: config.cooldownMs.network;
-	if (cd <= 0 && reason === "network") return;
+		cleanupStaleAssignments(state, config.assignmentTtlMs);
+		const newKeyIndex = chooseAvailableKey(state, keys.length);
+		if (newKeyIndex >= 0) state.assignments[sessionId] = { keyIndex: newKeyIndex, since: Date.now() };
 
-	state.cooled[String(assignment.keyIndex)] = { exhaustedAt: Date.now(), cooldownMs: cd, reason };
-	saveState(state);
+		state.retryCounts ??= {};
+		state.retryCounts[sessionId] = (state.retryCounts[sessionId] ?? state.retryCount ?? 0) + 1;
+		state.retryCount = state.retryCounts[sessionId];
+		if (debugEnabled) appendDebugLog(state, oldKeyIndex, sessionId, reason, debugMessage, `switch→#${newKeyIndex + 1}`);
+		return { oldKeyIndex, newKeyIndex };
+	});
+}
+
+function getRetryCount(state: KeyState, sessionId: string): number {
+	return state.retryCounts?.[sessionId] ?? state.retryCount ?? 0;
+}
+
+function resetRetryCount(sessionId: string): void {
+	updateState((state) => {
+		if (state.retryCounts?.[sessionId]) delete state.retryCounts[sessionId];
+		state.retryCount = 0;
+	});
 }
 
 // ── 自动配置 models.json ──────────────────────────────────
-
-const MODELS_FILE = join(HOME, ".pi", "models.json");
 
 function autoConfigureModelsJson(): void {
 	try {
@@ -357,237 +491,197 @@ function autoConfigureModelsJson(): void {
 
 		let models: Record<string, any> = {};
 		if (existsSync(MODELS_FILE)) {
-			try { models = JSON.parse(readFileSync(MODELS_FILE, "utf-8")); } catch {}
+			try {
+				models = JSON.parse(readFileSync(MODELS_FILE, "utf-8"));
+			} catch {
+				return;
+			}
+			const backup = `${MODELS_FILE}.bak-key-pool`;
+			if (!existsSync(backup)) copyFileSync(MODELS_FILE, backup);
 		}
 
-		if (!models.providers) models.providers = {};
-
-		const scriptPath = join(AGENT_DIR, "get-current-key.sh");
-		if (!models.providers[targetProvider]) {
-			models.providers[targetProvider] = {};
-		}
-		models.providers[targetProvider].apiKey = `!bash ${scriptPath}`;
-
-		writeFileSync(MODELS_FILE, JSON.stringify(models, null, 2), "utf-8");
-	} catch {
-		// 不阻塞加载
-	}
+		if (!models.providers || typeof models.providers !== "object") models.providers = {};
+		models.providers[targetProvider] ??= {};
+		models.providers[targetProvider].apiKey = `!bash ${shellQuote(SCRIPT_FILE)}`;
+		writeFileSync(MODELS_FILE, JSON.stringify(models, null, 2), { encoding: "utf-8", mode: 0o600 });
+		secureFile(MODELS_FILE, 0o600);
+	} catch { /* 不阻塞加载 */ }
 }
 
 // ── Extension 入口 ─────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-
-	// ── 首次加载初始化 ─────────────────────────────────
 	if (!existsSync(AGENT_DIR)) mkdirSync(AGENT_DIR, { recursive: true });
-	if (!existsSync(KEYS_FILE) || readFileSync(KEYS_FILE, "utf-8").trim() === "")
-		writeFileSync(KEYS_FILE, JSON.stringify({ keys: [{ key: "", label: "key-1" }] }, null, 2), "utf-8");
-	if (!existsSync(CONFIG_FILE))
-		writeFileSync(CONFIG_FILE, JSON.stringify(DEFAULT_CONFIG, null, 2), "utf-8");
-	
-	// 检测并补充缺失的配置字段（版本升级兼容）
+	if (!existsSync(KEYS_FILE) || readFileSync(KEYS_FILE, "utf-8").trim() === "") {
+		writeFileSync(KEYS_FILE, JSON.stringify({ keys: [{ key: "", provider: "", label: "key-1" }] }, null, 2), { encoding: "utf-8", mode: 0o600 });
+	}
+	if (!existsSync(CONFIG_FILE)) writeConfig(DEFAULT_CONFIG);
+	secureFile(KEYS_FILE, 0o600);
 	migrateConfig();
-
+	deployGetCurrentKeyScript();
 	autoConfigureModelsJson();
 
-	// ── 当前 session ID（闭包内）────────────────────────
 	let currentSessionId: string | null = null;
-
-	// ── 重试状态（闭包内）────────────────────────────────
-	let isRetrying = false;
+	let retryScheduled = false;
 
 	function retryLastUserMessage(ctx: ExtensionContext): void {
-		if (isRetrying) return;
+		if (retryScheduled) return;
 		const branch = ctx.sessionManager.getBranch();
 		const lastUser = branch.slice().reverse().find((e: any) => e.type === "message" && e.message?.role === "user");
 		if (!lastUser?.message?.content) return;
-		isRetrying = true;
+		retryScheduled = true;
 		ctx.ui.notify("🔄 Switching key and retrying...", "warning");
-		pi.sendMessage({
-			customType: "key-pool",
-			content: `[auto-retry] ${typeof lastUser.message.content === "string" ? lastUser.message.content : JSON.stringify(lastUser.message.content)}`,
-			display: false,
-		}, { deliverAs: "steer" });
-		setTimeout(() => { isRetrying = false; }, 5000);
+		pi.sendUserMessage(lastUser.message.content as any, { deliverAs: "followUp" });
+		setTimeout(() => { retryScheduled = false; }, 1_000);
 	}
 
-	// ════════════════════════════════════════════════════════════
-	// 策略 1：Session 绑定
-	// ════════════════════════════════════════════════════════════
 	pi.on("session_start", (_event, ctx) => {
 		const keys = readKeys();
 		if (keys.length === 0) {
-			ctx.ui.notify("key-pool: no keys configured", "error");
+			ctx.ui.notify("key-pool: no non-empty keys configured", "error");
 			return;
 		}
 
-		// 生成 session ID
 		currentSessionId = randomUUID();
+		process.env.PI_KEY_POOL_SESSION_ID = currentSessionId;
 		writeSessionId(currentSessionId);
 
-		// 分配 key
 		const keyIndex = assignKeyToSession(currentSessionId);
-		const state = loadState();
-		const assignment = state.assignments[currentSessionId];
-
-		if (keyIndex >= 0 && assignment) {
+		if (keyIndex >= 0) {
 			const label = keys[keyIndex].label ? ` (${keys[keyIndex].label})` : "";
 			ctx.ui.notify(`key-pool: session ${currentSessionId.slice(0, 8)}... → key #${keyIndex + 1}${label}`, "info");
 		} else {
-			ctx.ui.notify("key-pool: failed to assign key", "error");
+			ctx.ui.notify("key-pool: no available key (all keys are cooling)", "error");
 		}
 	});
 
-	// ════════════════════════════════════════════════════════════
-	// 策略 2：Session 清理
-	// ════════════════════════════════════════════════════════════
 	pi.on("session_shutdown", () => {
-		if (currentSessionId) {
-			releaseSessionAssignment(currentSessionId);
-			currentSessionId = null;
-		}
-		removeSessionFile();
+		if (!currentSessionId) return;
+		releaseSessionAssignment(currentSessionId);
+		if (process.env.PI_KEY_POOL_SESSION_ID === currentSessionId) delete process.env.PI_KEY_POOL_SESSION_ID;
+		removeSessionFile(currentSessionId);
+		currentSessionId = null;
 	});
 
-	// ════════════════════════════════════════════════════════════
-	// 策略 3：错误检测 + 冷却 + 重试
-	// ════════════════════════════════════════════════════════════
 	pi.on("turn_end", (event, ctx) => {
-		if (isRetrying) return;
 		if (!currentSessionId) return;
-
 		const msg = event.message;
-		if (!msg || msg.role !== "assistant" || msg.stopReason !== "error") return;
 
-		const cfg = loadConfig();
-		const state = loadState();
-
-		if (state.retryCount >= cfg.maxRetries) {
-			const errMsg = msg.errorMessage ?? "unknown";
-			ctx.ui.notify(`❌ key-pool: max retries (${cfg.maxRetries}) reached.${cfg.debug ? ` ${errMsg.slice(0, 120)}` : ""}`, "error");
-			if (cfg.debug) { appendDebugLog(state, state.assignments[currentSessionId]?.keyIndex ?? 0, currentSessionId, "unknown", errMsg, "max-retries"); saveState(state); }
-			state.retryCount = 0; saveState(state); return;
-		}
-
-		const classification = classifyError(msg.errorMessage);
-		if (!classification.shouldSwitch) {
-			if (classification.type === "network")
-				ctx.ui.notify(`⚡ key-pool: network error (not switching)${cfg.debug ? `: ${(msg.errorMessage ?? "").slice(0, 80)}` : ""}`, "info");
+		if (msg?.role === "assistant" && msg.stopReason !== "error") {
+			const state = loadState();
+			if (getRetryCount(state, currentSessionId) > 0) resetRetryCount(currentSessionId);
 			return;
 		}
 
-		const oldKeyIndex = state.assignments[currentSessionId]?.keyIndex ?? 0;
-		markSessionKeyCooled(currentSessionId, classification.type);
+		if (!msg || msg.role !== "assistant" || msg.stopReason !== "error") return;
+		const cfg = loadConfig();
+		const state = loadState();
+		const retryCount = getRetryCount(state, currentSessionId);
+		const errMsg = msg.errorMessage ?? "unknown";
 
-		// 释放当前 session 的分配，重新分配
-		releaseSessionAssignment(currentSessionId);
-		const newKeyIndex = assignKeyToSession(currentSessionId);
+		if (retryCount >= cfg.maxRetries) {
+			ctx.ui.notify(`❌ key-pool: max retries (${cfg.maxRetries}) reached.${cfg.debug ? ` ${redactSensitive(errMsg).slice(0, 120)}` : ""}`, "error");
+			updateState((s) => {
+				if (cfg.debug) appendDebugLog(s, s.assignments[currentSessionId!]?.keyIndex ?? -1, currentSessionId!, "unknown", errMsg, "max-retries");
+				if (s.retryCounts) delete s.retryCounts[currentSessionId!];
+				s.retryCount = 0;
+			});
+			return;
+		}
 
-		const updatedState = loadState();
-		updatedState.retryCount++;
-		if (cfg.debug) appendDebugLog(updatedState, oldKeyIndex, currentSessionId, classification.type, msg.errorMessage ?? "", `switch→#${newKeyIndex + 1}`);
-		saveState(updatedState);
+		const classification = classifyError(errMsg);
+		if (!classification.shouldSwitch) {
+			if (classification.type === "network") ctx.ui.notify(`⚡ key-pool: network error (not switching)${cfg.debug ? `: ${redactSensitive(errMsg).slice(0, 80)}` : ""}`, "info");
+			return;
+		}
 
-		const errorPreview = (msg.errorMessage ?? "").slice(0, 80);
+		const result = switchSessionKeyAfterError(currentSessionId, classification.type, errMsg, cfg.debug);
+		if (result.newKeyIndex < 0) {
+			ctx.ui.notify("❌ key-pool: all keys are cooling; retry skipped", "error");
+			return;
+		}
+
+		const errorPreview = redactSensitive(errMsg).slice(0, 80);
 		pi.sendMessage({
 			customType: "key-pool",
-			content: `⚠️ #${oldKeyIndex + 1} [${classification.type}] ${errorPreview}\n   → #${newKeyIndex + 1}`,
+			content: `⚠️ #${result.oldKeyIndex + 1} [${classification.type}] ${errorPreview}\n   → #${result.newKeyIndex + 1}`,
 			display: true,
 		}, { deliverAs: "followUp" });
 
 		retryLastUserMessage(ctx);
 	});
 
-	// ════════════════════════════════════════════════════════════
-	// 命令：查看池状态
-	// ════════════════════════════════════════════════════════════
 	pi.registerCommand("pool-status", {
 		description: "查看 key pool 状态",
 		handler: async (_args, ctx) => {
 			const keys = readKeys();
 			const state = loadState();
 			const cfg = loadConfig();
-			if (keys.length === 0) { ctx.ui.notify("key-pool: keys.json is empty", "error"); return; }
+			if (keys.length === 0) { ctx.ui.notify("key-pool: keys.json has no non-empty keys", "error"); return; }
 
 			const activeCooled = Object.values(state.cooled).filter((e) => isCooled(e)).length;
 			const activeAssignments = Object.keys(state.assignments).length;
-			const lines: string[] = [];
+			const lines: string[] = [`Key Pool: ${keys.length} keys | ${activeAssignments} sessions | ${activeCooled} cooling`, ""];
 
-			lines.push(`Key Pool: ${keys.length} keys | ${activeAssignments} sessions | ${activeCooled} cooling`);
-			lines.push("");
-
-			// 显示当前 session
 			if (currentSessionId) {
 				const assignment = state.assignments[currentSessionId];
 				if (assignment) {
-					const label = keys[assignment.keyIndex].label ? ` (${keys[assignment.keyIndex].label})` : "";
+					const label = keys[assignment.keyIndex]?.label ? ` (${keys[assignment.keyIndex].label})` : "";
 					lines.push(`Current session: ${currentSessionId.slice(0, 8)}... → key #${assignment.keyIndex + 1}${label}`);
 				}
 			}
 			lines.push("");
 
-			// 显示所有 keys
 			for (let i = 0; i < keys.length; i++) {
 				const ke = keys[i];
-				const masked = ke.key.slice(0, 14) + "...";
 				const label = ke.label ? `(${ke.label})` : "";
 				const parts: string[] = [];
-
-				// 哪些 session 在用这个 key
-				const sessionsUsing = Object.entries(state.assignments)
-					.filter(([, a]) => a.keyIndex === i)
-					.map(([sid]) => sid.slice(0, 8) + "...");
+				const sessionsUsing = Object.entries(state.assignments).filter(([, a]) => a.keyIndex === i).map(([sid]) => `${sid.slice(0, 8)}...`);
 				if (sessionsUsing.length > 0) parts.push(`sessions: ${sessionsUsing.join(", ")}`);
-
 				const cd = state.cooled[String(i)];
 				if (cd && isCooled(cd)) parts.push(`❄️ ${cd.reason} ${formatCooldown(remainingCooldown(cd))}`);
 				else if (cd) parts.push(`✅ ${cd.reason} (recovered)`);
-
-				lines.push(`  #${i + 1}  ${masked}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
+				lines.push(`  #${i + 1}  ${maskKey(ke.key)}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
 			}
 
 			lines.push("");
-			lines.push(`Retry: ${state.retryCount}/${cfg.maxRetries} | Debug: ${cfg.debug ? "ON" : "OFF"}`);
-			lines.push(`Cooldowns: capacity=${cfg.cooldownMs.capacity / 1000}s, quota=${cfg.cooldownMs.quota / 1000}s`);
+			lines.push(`Retry: ${currentSessionId ? getRetryCount(state, currentSessionId) : 0}/${cfg.maxRetries} | Debug: ${cfg.debug ? "ON" : "OFF"}`);
+			lines.push(`Cooldowns: capacity=${cfg.cooldownMs.capacity / 1000}s, quota=${cfg.cooldownMs.quota / 1000}s, network=${cfg.cooldownMs.network / 1000}s`);
 			lines.push(`Assignment TTL: ${cfg.assignmentTtlMs / 60000}min`);
 
 			if (cfg.debug && state.debugLog?.length) {
 				lines.push("", "--- Debug Log ---");
-				for (const e of state.debugLog.slice(-10))
-					lines.push(`  [${new Date(e.timestamp).toLocaleTimeString()}] #${e.keyIndex + 1} (${e.sessionId}...) [${e.errorType}] ${e.action}: ${e.errorMessage.slice(0, 80)}`);
+				for (const e of state.debugLog.slice(-10)) lines.push(`  [${new Date(e.timestamp).toLocaleTimeString()}] #${e.keyIndex + 1} (${e.sessionId}...) [${e.errorType}] ${e.action}: ${e.errorMessage.slice(0, 80)}`);
 			}
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
 
-	// ════════════════════════════════════════════════════════════
-	// 命令：清除冷却标记
-	// ════════════════════════════════════════════════════════════
 	pi.registerCommand("pool-reset", {
 		description: "清除所有冷却标记",
 		handler: async (_args, ctx) => {
-			const state = loadState();
-			const count = Object.keys(state.cooled).length;
-			state.cooled = {};
-			state.retryCount = 0;
-			if (state.debugLog) state.debugLog = [];
-			saveState(state);
+			const count = updateState((state) => {
+				const current = Object.keys(state.cooled).length;
+				state.cooled = {};
+				state.retryCount = 0;
+				state.retryCounts = {};
+				state.debugLog = [];
+				return current;
+			});
 			ctx.ui.notify(`Pool reset: ${count} cooldowns cleared`, "info");
 		},
 	});
 
-	// ════════════════════════════════════════════════════════════
-	// 命令：清理僵尸 assignments
-	// ════════════════════════════════════════════════════════════
 	pi.registerCommand("pool-clean", {
 		description: "清理超时的 session 绑定",
 		handler: async (_args, ctx) => {
-			const state = loadState();
 			const cfg = loadConfig();
-			const before = Object.keys(state.assignments).length;
-			const cleaned = cleanupStaleAssignments(state, cfg.assignmentTtlMs);
-			saveState(state);
-			ctx.ui.notify(`Cleaned ${cleaned} stale assignments (${before} → ${Object.keys(state.assignments).length})`, "info");
+			const result = updateState((state) => {
+				const before = Object.keys(state.assignments).length;
+				const cleaned = cleanupStaleAssignments(state, cfg.assignmentTtlMs);
+				return { before, after: Object.keys(state.assignments).length, cleaned };
+			});
+			ctx.ui.notify(`Cleaned ${result.cleaned} stale assignments (${result.before} → ${result.after})`, "info");
 		},
 	});
 }

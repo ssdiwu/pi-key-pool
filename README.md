@@ -72,6 +72,7 @@ Edit `~/.pi/agent/key-pool/keys.json`:
 That's it. The extension will:
 - Auto-create `~/.pi/agent/key-pool/` directory on first load
 - Auto-generate `pool-config.json` with defaults
+- Auto-deploy `get-current-key.sh` into the runtime directory
 - Auto-configure `models.json` with the correct provider + `!bash` injection
 
 ### 3. Verify
@@ -115,7 +116,8 @@ Cooldowns: capacity=30s, quota=300s, network=off
 ```
 /new (new session)
   ├─ session_start → generate sessionId → assignKeyToSession()
-  ├─ write .current-session + .key-state (assignments)
+  ├─ write PI_KEY_POOL_SESSION_ID (process env) + .current-session fallback
+  ├─ write .key-state (assignments)
   └─ Next request → !bash script reads session → outputs bound key ✅
 
 Parallel sessions
@@ -233,7 +235,8 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 ├── keys.json                     # Your actual keys
 ├── pool-config.json              # Your config (optional)
 ├── .key-state                    # Runtime state (assignments + cooldowns)
-├── .current-session              # Current session ID (for get-current-key.sh)
+├── .key-state.lock/              # Cross-process state lock (temporary)
+├── .current-session              # Fallback session ID for shell script
 └── get-current-key.sh            # Deployed shell script
 ```
 
@@ -243,7 +246,7 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 
 pi loads `auth.json` **before** extensions are initialized. Writing to auth.json from an extension is too late — the current session would still use the old key.
 
-Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` and `.current-session` to output the correct key. No timing issues.
+Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` plus `PI_KEY_POOL_SESSION_ID` (with `.current-session` as fallback) to output the correct key. No timing issues.
 
 ### Why session-based binding (not rotation)?
 
@@ -257,7 +260,7 @@ Session-based binding solves this:
 
 ### Why shell script instead of pure TS?
 
-pi's `models.json` supports `!bash <command>` for dynamic apiKey resolution. This is the official mechanism for runtime key injection. The shell script is minimal (~75 lines), reads JSON state, handles cooldown skipping, and outputs the chosen key.
+pi's `models.json` supports `!bash <command>` for dynamic apiKey resolution. This is the official mechanism for runtime key injection. The shell script is deployed automatically by the extension, reads assignment state, handles cooldown fallback, and outputs the chosen key.
 
 ## vs Alternatives
 

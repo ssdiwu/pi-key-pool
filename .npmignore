@@ -2,10 +2,13 @@
 keys.json
 pool-config.json
 .key-state
-get-current-key.sh
+.current-session
+.key-state.lock
 
-# Development
+# Development / local documentation
 .gitignore
+.doc/
+*.tgz
 *.md
 !README.md
 
