@@ -227,14 +227,8 @@ try:
             )
             if taken:
                 continue
-        # 跳过已被其他 session 占用的 key（老扁平格式）
-        taken_flat = any(
-            isinstance(a, dict) and a.get("keyIndex") == i
-            for sid, a in assignments.items()
-            if sid != requested_provider and sid != session_id and isinstance(a, dict) and "keyIndex" in a
-        )
-        if taken_flat:
-            continue
+        # 老扁平格式的 assignments（顶层 key 是 sessionId 而非 provider）已被
+        # getProviderAssignments() 视为空，新代码不会拿它们当约束。这里不再检查。
         available.append(i)
     if not available:
         remaining = []
