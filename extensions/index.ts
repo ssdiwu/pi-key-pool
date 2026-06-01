@@ -52,7 +52,12 @@ interface Assignment {
 }
 
 interface KeyState {
-	assignments: Record<string, Assignment>;
+	/**
+	 * 按 provider 分桶的 session 绑定。
+	 * 新格式：{ [provider]: { [sessionId]: Assignment } }
+	 * 老格式（兼容读取）：{ [sessionId]: Assignment } — 读不到时直接当空处理
+	 */
+	assignments: Record<string, Assignment> | Record<string, Record<string, Assignment>>;
 	cooled: Record<string, CooldownEntry>;
 	/** legacy global counter, kept for migration */
 	retryCount: number;
@@ -102,6 +107,7 @@ const DEFAULT_CONFIG: PoolConfig = {
 const GET_CURRENT_KEY_SCRIPT = `#!/bin/bash
 # 读取 ~/.pi/agent/key-pool/ 状态，输出当前 session 应使用的 API key。
 # 优先使用 PI_KEY_POOL_SESSION_ID，fallback 到 .current-session。
+# 按 PI_KEY_POOL_PROVIDER 过滤（未设置时取 keys.json 第一个非空 provider）。
 
 set -euo pipefail
 
@@ -124,18 +130,43 @@ try:
     with open(keys_file, encoding="utf-8") as f:
         data = json.load(f)
     arr = data if isinstance(data, list) else data.get("keys", [])
-    keys = []
-    for item in arr:
-        if isinstance(item, dict):
-            key = item.get("key")
-        else:
-            key = item
-        if isinstance(key, str) and key.strip():
-            keys.append(key.strip())
 
-    if not keys:
+    # 收集所有非空 key，按 provider 索引
+    items = []  # list of {"key": str, "provider": str|None, "index": int}
+    for i, item in enumerate(arr):
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        if not (isinstance(key, str) and key.strip()):
+            continue
+        provider = item.get("provider")
+        if isinstance(provider, str):
+            provider = provider.strip() or None
+        else:
+            provider = None
+        items.append({"key": key.strip(), "provider": provider, "index": i})
+
+    if not items:
         print(f"ERROR: no keys in {keys_file}", file=sys.stderr)
         sys.exit(1)
+
+    requested_provider = os.environ.get("PI_KEY_POOL_PROVIDER")
+    provider_key_indexes = []
+    if requested_provider:
+        provider_key_indexes = [it["index"] for it in items if it["provider"] == requested_provider]
+        if not provider_key_indexes:
+            # fallback: provider 未配置，使用第一个非空 key
+            provider_key_indexes = [it["index"] for it in items if it["provider"]][:1] or [items[0]["index"]]
+    else:
+        # 未指定 provider: 使用第一个带 provider 的 key，否则取第一个
+        with_provider = [it for it in items if it["provider"]]
+        if with_provider:
+            provider_key_indexes = [with_provider[0]["index"]]
+        else:
+            provider_key_indexes = [items[0]["index"]]
+
+    # 计算全局 key 索引位置（用于在 keys 数组中取 key 字符串）
+    key_strings = [it["key"] for it in items]
 
     state = {}
     try:
@@ -166,14 +197,45 @@ try:
     idx = None
     assignments = state.get("assignments", {}) if isinstance(state, dict) else {}
     if session_id and isinstance(assignments, dict):
-        assignment = assignments.get(session_id)
-        if isinstance(assignment, dict) and isinstance(assignment.get("keyIndex"), int):
-            idx = assignment["keyIndex"]
+        # 嵌套新格式: assignments[provider][sessionId]
+        if requested_provider:
+            bucket = assignments.get(requested_provider)
+            if isinstance(bucket, dict):
+                a = bucket.get(session_id)
+                if isinstance(a, dict) and isinstance(a.get("keyIndex"), int):
+                    idx = a["keyIndex"]
+        # 老扁平格式: assignments[sessionId]（兼容）
+        if idx is None:
+            a = assignments.get(session_id)
+            if isinstance(a, dict) and isinstance(a.get("keyIndex"), int):
+                idx = a["keyIndex"]
 
     if idx is None and isinstance(state.get("index"), int):
         idx = state["index"]
 
-    available = [i for i in range(len(keys)) if not is_cooled(i)]
+    available = []
+    for i in provider_key_indexes:
+        if is_cooled(i):
+            continue
+        # 跳过已被该 provider 其他 session 占用的 key（嵌套新格式；当前 session 自己的绑定保留）
+        if requested_provider and isinstance(assignments.get(requested_provider), dict):
+            bucket = assignments[requested_provider]
+            taken = any(
+                isinstance(a, dict) and a.get("keyIndex") == i
+                for sid, a in bucket.items()
+                if sid != session_id and a is not None
+            )
+            if taken:
+                continue
+        # 跳过已被其他 session 占用的 key（老扁平格式）
+        taken_flat = any(
+            isinstance(a, dict) and a.get("keyIndex") == i
+            for sid, a in assignments.items()
+            if sid != requested_provider and sid != session_id and isinstance(a, dict) and "keyIndex" in a
+        )
+        if taken_flat:
+            continue
+        available.append(i)
     if not available:
         remaining = []
         now = time.time() * 1000
@@ -193,10 +255,10 @@ try:
         print(f"ERROR: all keys are cooling{wait}", file=sys.stderr)
         sys.exit(2)
 
-    if idx is None or idx < 0 or idx >= len(keys) or is_cooled(idx):
+    if idx is None or idx not in provider_key_indexes or is_cooled(idx):
         idx = available[0]
 
-    print(keys[idx])
+    print(key_strings[idx])
 except Exception as ex:
     print(f"ERROR: {ex}", file=sys.stderr)
     sys.exit(1)
@@ -337,6 +399,32 @@ function readKeys(): KeyEntry[] {
 	} catch { return []; }
 }
 
+/** 收集 keys.json 中出现的所有非空 provider 集合。 */
+function getManagedProviders(): Set<string> {
+	const out = new Set<string>();
+	for (const k of readKeys()) {
+		if (k.provider && k.provider.trim()) out.add(k.provider);
+	}
+	return out;
+}
+
+/** 当前 provider 是否被 key-pool 管理（即 keys.json 中存在该 provider 的 key）。 */
+function isManagedProvider(provider: string | undefined | null): boolean {
+	if (!provider) return false;
+	return getManagedProviders().has(provider);
+}
+
+/** 按 provider 分组 keys；保留每个 key 在原始 keys 数组中的 index。 */
+function groupKeysByProvider(keys: KeyEntry[]): Record<string, Array<{ entry: KeyEntry; index: number }>> {
+	const groups: Record<string, Array<{ entry: KeyEntry; index: number }>> = {};
+	for (let i = 0; i < keys.length; i++) {
+		const k = keys[i];
+		if (!k.provider) continue;
+		(groups[k.provider] ??= []).push({ entry: k, index: i });
+	}
+	return groups;
+}
+
 function writeSessionId(sessionId: string): void {
 	writeFileSync(SESSION_FILE, sessionId, { encoding: "utf-8", mode: 0o600 });
 	secureFile(SESSION_FILE, 0o600);
@@ -423,10 +511,23 @@ function maskKey(key: string): string {
 function cleanupStaleAssignments(state: KeyState, ttlMs: number): number {
 	const now = Date.now();
 	let cleaned = 0;
-	for (const [sid, assignment] of Object.entries(state.assignments)) {
-		if (now - assignment.since > ttlMs) {
-			delete state.assignments[sid];
-			delete state.retryCounts?.[sid];
+	for (const [outerKey, value] of Object.entries(state.assignments)) {
+		// 嵌套新格式：{ [provider]: { [sid]: Assignment } }
+		if (value && typeof value === "object" && !("keyIndex" in value) && !("since" in value)) {
+			for (const [sid, assignment] of Object.entries(value as Record<string, Assignment>)) {
+				if (assignment && now - assignment.since > ttlMs) {
+					delete (value as Record<string, Assignment>)[sid];
+					delete state.retryCounts?.[sid];
+					cleaned++;
+				}
+			}
+			continue;
+		}
+		// 老扁平格式：{ [sid]: Assignment }
+		const assignment = value as Assignment;
+		if (assignment && now - assignment.since > ttlMs) {
+			delete state.assignments[outerKey];
+			delete state.retryCounts?.[outerKey];
 			cleaned++;
 		}
 	}
@@ -435,56 +536,98 @@ function cleanupStaleAssignments(state: KeyState, ttlMs: number): number {
 
 // ── 核心：分配 key 给 session ────────────────────────────────
 
-function chooseAvailableKey(state: KeyState, total: number): number {
-	const assignedIndexes = new Set(Object.values(state.assignments).map((a) => a.keyIndex));
-	for (let candidate = 0; candidate < total; candidate++) {
-		if (!assignedIndexes.has(candidate) && !isCooled(state.cooled[String(candidate)])) return candidate;
+/**
+ * 从 provider 绑定的 session 子集（`state.assignments[provider]`）中取已分配的 keyIndex。
+ * 兼容老格式：如果 assignments[provider] 不存在或为扁平结构，返回空。
+ */
+function getProviderAssignments(state: KeyState, provider: string): Record<string, Assignment> {
+	const bucket = state.assignments[provider];
+	if (bucket && typeof bucket === "object" && !Array.isArray(bucket)) {
+		// 校验：值是 Assignment 形状才认
+		const sample = Object.values(bucket)[0];
+		if (!sample || typeof sample === "object" && "keyIndex" in sample && "since" in sample) {
+			return bucket as Record<string, Assignment>;
+		}
 	}
-	for (let candidate = 0; candidate < total; candidate++) {
-		if (!isCooled(state.cooled[String(candidate)])) return candidate;
+	return {};
+}
+
+/**
+ * 在某个 provider 的 key 子集中挑一个可用的。
+ * 跳过已被该 provider 其他 session 占用的，跳过冷却的；已分配给该 session 自己的优先保留。
+ * 返回该 provider 在 `keys` 数组中的原始 keyIndex（用于输出 key 本身），或 -1。
+ */
+function chooseAvailableKeyForProvider(state: KeyState, provider: string, providerKeyIndexes: number[], sessionId?: string): number {
+	if (providerKeyIndexes.length === 0) return -1;
+	const providerAssignments = getProviderAssignments(state, provider);
+	const myAssignment = sessionId ? providerAssignments[sessionId] : undefined;
+	if (myAssignment && !isCooled(state.cooled[String(myAssignment.keyIndex)])) return myAssignment.keyIndex;
+	const assignedIndexes = new Set(Object.values(providerAssignments).map((a) => a.keyIndex));
+	for (const idx of providerKeyIndexes) {
+		if (!assignedIndexes.has(idx) && !isCooled(state.cooled[String(idx)])) return idx;
 	}
 	return -1;
 }
 
-function assignKeyToSession(sessionId: string): number {
+function assignKeyToProviderSession(provider: string, sessionId: string): number {
 	const keys = readKeys();
 	const config = loadConfig();
 	if (keys.length === 0) return -1;
 
+	const groups = groupKeysByProvider(keys);
+	const providerKeyIndexes = (groups[provider] ?? []).map((g) => g.index);
+	if (providerKeyIndexes.length === 0) return -1;
+
 	return updateState((state) => {
 		cleanupStaleAssignments(state, config.assignmentTtlMs);
-		const existing = state.assignments[sessionId];
+		// 初始化分桶
+		if (!state.assignments[provider] || typeof (state.assignments as any)[provider] !== "object") {
+			(state.assignments as Record<string, Record<string, Assignment>>)[provider] = {};
+		}
+		const providerAssignments = getProviderAssignments(state, provider);
+		const existing = providerAssignments[sessionId];
 		if (existing && !isCooled(state.cooled[String(existing.keyIndex)])) return existing.keyIndex;
 
-		const keyIndex = chooseAvailableKey(state, keys.length);
+		const keyIndex = chooseAvailableKeyForProvider(state, provider, providerKeyIndexes);
 		if (keyIndex < 0) return -1;
-		state.assignments[sessionId] = { keyIndex, since: Date.now() };
+		(state.assignments as Record<string, Record<string, Assignment>>)[provider][sessionId] = { keyIndex, since: Date.now() };
 		return keyIndex;
 	});
 }
 
-function releaseSessionAssignment(sessionId: string): void {
+function releaseProviderSession(provider: string, sessionId: string): void {
 	updateState((state) => {
-		delete state.assignments[sessionId];
+		const bucket = (state.assignments as Record<string, Record<string, Assignment>>)[provider];
+		if (bucket) delete bucket[sessionId];
 		delete state.retryCounts?.[sessionId];
 	});
 }
 
-function switchSessionKeyAfterError(sessionId: string, reason: ErrorType, debugMessage: string, debugEnabled: boolean): { oldKeyIndex: number; newKeyIndex: number } {
+function switchProviderSessionKey(provider: string, sessionId: string, reason: ErrorType, debugMessage: string, debugEnabled: boolean): { oldKeyIndex: number; newKeyIndex: number } {
 	const keys = readKeys();
 	const config = loadConfig();
+	const groups = groupKeysByProvider(keys);
+	const providerKeyIndexes = (groups[provider] ?? []).map((g) => g.index);
+
 	return updateState((state) => {
-		const assignment = state.assignments[sessionId];
+		// 初始化分桶
+		if (!state.assignments[provider] || typeof (state.assignments as any)[provider] !== "object") {
+			(state.assignments as Record<string, Record<string, Assignment>>)[provider] = {};
+		}
+		const providerAssignments = getProviderAssignments(state, provider);
+		const assignment = providerAssignments[sessionId];
 		const oldKeyIndex = assignment?.keyIndex ?? -1;
 		if (assignment) {
 			const cooldownMs = reason === "capacity" ? config.cooldownMs.capacity : reason === "quota" ? config.cooldownMs.quota : config.cooldownMs.network;
 			if (cooldownMs > 0) state.cooled[String(assignment.keyIndex)] = { exhaustedAt: Date.now(), cooldownMs, reason };
-			delete state.assignments[sessionId];
+			delete providerAssignments[sessionId];
 		}
 
 		cleanupStaleAssignments(state, config.assignmentTtlMs);
-		const newKeyIndex = chooseAvailableKey(state, keys.length);
-		if (newKeyIndex >= 0) state.assignments[sessionId] = { keyIndex: newKeyIndex, since: Date.now() };
+		const newKeyIndex = chooseAvailableKeyForProvider(state, provider, providerKeyIndexes);
+		if (newKeyIndex >= 0) {
+			(state.assignments as Record<string, Record<string, Assignment>>)[provider][sessionId] = { keyIndex: newKeyIndex, since: Date.now() };
+		}
 
 		state.retryCounts ??= {};
 		state.retryCounts[sessionId] = (state.retryCounts[sessionId] ?? state.retryCount ?? 0) + 1;
@@ -512,8 +655,12 @@ function autoConfigureModelsJson(): void {
 		const keys = readKeys();
 		if (keys.length === 0) return;
 
-		const targetProvider = keys[0].provider || "";
-		if (!targetProvider) return;
+		// 收集所有出现过的 provider（去重）
+		const providers = new Set<string>();
+		for (const k of keys) {
+			if (k.provider && k.provider.trim()) providers.add(k.provider);
+		}
+		if (providers.size === 0) return;
 
 		let models: Record<string, any> = {};
 		if (existsSync(MODELS_FILE)) {
@@ -527,8 +674,10 @@ function autoConfigureModelsJson(): void {
 		}
 
 		if (!models.providers || typeof models.providers !== "object") models.providers = {};
-		models.providers[targetProvider] ??= {};
-		models.providers[targetProvider].apiKey = `!bash ${shellQuote(SCRIPT_FILE)}`;
+		for (const provider of providers) {
+			models.providers[provider] ??= {};
+			models.providers[provider].apiKey = `!bash ${shellQuote(SCRIPT_FILE)}`;
+		}
 		writeFileSync(MODELS_FILE, JSON.stringify(models, null, 2), { encoding: "utf-8", mode: 0o600 });
 		secureFile(MODELS_FILE, 0o600);
 	} catch { /* 不阻塞加载 */ }
@@ -565,33 +714,46 @@ export default function (pi: ExtensionAPI) {
 		const keys = readKeys();
 		if (keys.length === 0) {
 			ctx.ui.notify("key-pool: no non-empty keys configured", "error");
-			return;
 		}
 
 		currentSessionId = randomUUID();
 		process.env.PI_KEY_POOL_SESSION_ID = currentSessionId;
 		writeSessionId(currentSessionId);
+		// 不预先分配 key：等首次 model_select 触发绑定，避免 session 被错误预绑定到非 managed provider。
+	});
 
-		const keyIndex = assignKeyToSession(currentSessionId);
-		if (keyIndex >= 0) {
-			const label = keys[keyIndex].label ? ` (${keys[keyIndex].label})` : "";
-			ctx.ui.notify(`key-pool: session ${currentSessionId.slice(0, 8)}... → key #${keyIndex + 1}${label}`, "info");
-		} else {
-			const recovery = nextRecoveryText(loadState());
-			ctx.ui.notify(`key-pool: no available key (all keys are cooling${recovery})`, "error");
+	pi.on("model_select", (event, _ctx) => {
+		if (!currentSessionId) return;
+		const provider = event.model?.provider;
+		if (!provider || !isManagedProvider(provider)) {
+			// 非 managed provider：清除 provider env，让 bash 走 fallback（取 keys.json 第一个带 provider 的 key）
+			delete process.env.PI_KEY_POOL_PROVIDER;
+			return;
 		}
+		process.env.PI_KEY_POOL_PROVIDER = provider;
+		// 按需分配一个 key 给该 session
+		assignKeyToProviderSession(provider, currentSessionId);
 	});
 
 	pi.on("session_shutdown", () => {
 		if (!currentSessionId) return;
-		releaseSessionAssignment(currentSessionId);
+		// 释放该 session 在所有 provider 下的绑定
+		const state = loadState();
+		for (const provider of Object.keys(state.assignments)) {
+			releaseProviderSession(provider, currentSessionId);
+		}
 		if (process.env.PI_KEY_POOL_SESSION_ID === currentSessionId) delete process.env.PI_KEY_POOL_SESSION_ID;
+		delete process.env.PI_KEY_POOL_PROVIDER;
 		removeSessionFile(currentSessionId);
 		currentSessionId = null;
 	});
 
 	pi.on("turn_end", (event, ctx) => {
 		if (!currentSessionId) return;
+		// 关键：只有当前 provider 被 key-pool 管理时才介入；非 managed provider (如 zai/GLM、openai-codex) 的错误不接管。
+		const provider = ctx.model?.provider;
+		if (!provider || !isManagedProvider(provider)) return;
+
 		const msg = event.message;
 
 		if (msg?.role === "assistant" && msg.stopReason !== "error") {
@@ -612,7 +774,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		const result = switchSessionKeyAfterError(currentSessionId, classification.type, errMsg, cfg.debug);
+		const result = switchProviderSessionKey(provider, currentSessionId, classification.type, errMsg, cfg.debug);
 		const attempt = retryCount + 1;
 		const errorPreview = redactSensitive(errMsg).slice(0, 80);
 
@@ -652,29 +814,59 @@ export default function (pi: ExtensionAPI) {
 			const cfg = loadConfig();
 			if (keys.length === 0) { ctx.ui.notify("key-pool: keys.json has no non-empty keys", "error"); return; }
 
+			// 计算总 session 数（按 provider 分桶后的）
+			let totalSessions = 0;
+			for (const value of Object.values(state.assignments)) {
+				if (value && typeof value === "object" && !("keyIndex" in value)) {
+					totalSessions += Object.keys(value).length;
+				} else {
+					// 老扁平格式当作 1 个 session
+					totalSessions += 1;
+				}
+			}
 			const activeCooled = Object.values(state.cooled).filter((e) => isCooled(e)).length;
-			const activeAssignments = Object.keys(state.assignments).length;
-			const lines: string[] = [`Key Pool: ${keys.length} keys | ${activeAssignments} sessions | ${activeCooled} cooling`, ""];
+			const lines: string[] = [`Key Pool: ${keys.length} keys | ${totalSessions} sessions | ${activeCooled} cooling`, ""];
 
 			if (currentSessionId) {
-				const assignment = state.assignments[currentSessionId];
+				const provider = process.env.PI_KEY_POOL_PROVIDER;
+				const providerAssignments = provider ? getProviderAssignments(state, provider) : {};
+				const assignment = providerAssignments[currentSessionId];
 				if (assignment) {
-					const label = keys[assignment.keyIndex]?.label ? ` (${keys[assignment.keyIndex].label})` : "";
-					lines.push(`Current session: ${currentSessionId.slice(0, 8)}... → key #${assignment.keyIndex + 1}${label}`);
+					const keyEntry = keys[assignment.keyIndex];
+					const label = keyEntry?.label ? ` (${keyEntry.label})` : "";
+					lines.push(`Current session: ${currentSessionId.slice(0, 8)}... → key #${assignment.keyIndex + 1}${label}${provider ? ` [${provider}]` : ""}`);
+				} else if (provider) {
+					lines.push(`Current session: ${currentSessionId.slice(0, 8)}... [${provider}] (no key assigned yet)`);
 				}
 			}
 			lines.push("");
 
-			for (let i = 0; i < keys.length; i++) {
-				const ke = keys[i];
-				const label = ke.label ? `(${ke.label})` : "";
-				const parts: string[] = [];
-				const sessionsUsing = Object.entries(state.assignments).filter(([, a]) => a.keyIndex === i).map(([sid]) => `${sid.slice(0, 8)}...`);
-				if (sessionsUsing.length > 0) parts.push(`sessions: ${sessionsUsing.join(", ")}`);
-				const cd = state.cooled[String(i)];
-				if (cd && isCooled(cd)) parts.push(`❄️ ${cd.reason} ${formatCooldown(remainingCooldown(cd))}`);
-				else if (cd) parts.push(`✅ ${cd.reason} (recovered)`);
-				lines.push(`  #${i + 1}  ${maskKey(ke.key)}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
+			// 按 provider 分组展示
+			const groups = groupKeysByProvider(keys);
+			const sortedProviders = Object.keys(groups).sort();
+			if (sortedProviders.length === 0) {
+				// 兜底：老 keys 没有 provider
+				for (let i = 0; i < keys.length; i++) {
+					const ke = keys[i];
+					const label = ke.label ? `(${ke.label})` : "";
+					lines.push(`  #${i + 1}  ${maskKey(ke.key)}${label}`);
+				}
+			} else {
+				for (const provider of sortedProviders) {
+					const groupItems = groups[provider];
+					const providerAssignments = getProviderAssignments(state, provider);
+					lines.push(`[${provider}]`);
+					for (const { entry: ke, index: i } of groupItems) {
+						const label = ke.label ? `(${ke.label})` : "";
+						const parts: string[] = [];
+						const sessionsUsing = Object.entries(providerAssignments).filter(([, a]) => a.keyIndex === i).map(([sid]) => `${sid.slice(0, 8)}...`);
+						if (sessionsUsing.length > 0) parts.push(`sessions: ${sessionsUsing.join(", ")}`);
+						const cd = state.cooled[String(i)];
+						if (cd && isCooled(cd)) parts.push(`❄️ ${cd.reason} ${formatCooldown(remainingCooldown(cd))}`);
+						else if (cd) parts.push(`✅ ${cd.reason} (recovered)`);
+						lines.push(`  #${i + 1}  ${maskKey(ke.key)}${label}${parts.length ? "  — " + parts.join(", ") : ""}`);
+					}
+				}
 			}
 
 			lines.push("");
