@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-02
+
 ### Changed
 - **按需分配 + provider 白名单**：session_start 不再预先分配 key，改为在 `model_select` 事件中
   按需建立 session → provider 绑定。`turn_end` 错误处理加 provider 白名单判断：当前
