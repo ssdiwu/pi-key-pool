@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-02
+
+### Fixed
+- **同步仓库根目录的 get-current-key.sh**：0.3.0 漏改了仓库根目录的独立脚本文件
+  （不是从 extensions/index.ts 里的 GET_CURRENT_KEY_SCRIPT 字符串部署出来的）。
+  后续 build agent 应在改动 GET_CURRENT_KEY_SCRIPT 字符串时同步更新根目录的
+  get-current-key.sh。
+- **老扁平 assignments 不再阻塞新分配**：0.3.0 在 bash 脚本 available 列表计算时把
+  老扁平格式的 assignments（顶层 key 是 sessionId 而非 provider）当成了"已占用"，
+  导致用户从 0.2.4 升级时残留的扁平 assignments 阻塞所有新 session 选 key，
+  报 "all keys are cooling"。getProviderAssignments() 已经把老扁平格式视为空，
+  bash 脚本不该再用它们当 taken 约束。
+
 ## [0.3.0] - 2026-06-02
 
 ### Changed
