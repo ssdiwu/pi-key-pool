@@ -36,7 +36,7 @@ const LOCK_DIR = join(AGENT_DIR, ".key-state.lock");
 const CONFIG_FILE = join(AGENT_DIR, "pool-config.json");
 const SESSION_FILE = join(AGENT_DIR, ".current-session");
 const SCRIPT_FILE = join(AGENT_DIR, "get-current-key.sh");
-const MODELS_FILE = join(HOME, ".pi", "models.json");
+const MODELS_FILE = join(HOME, ".pi", "agent", "models.json");
 
 // ── 类型定义 ─────────────────────────────────────────────────
 
