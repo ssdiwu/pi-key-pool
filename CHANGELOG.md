@@ -5,6 +5,19 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-02
+
+### Fixed
+- **切 key 状态信息不再注入到 LLM 上下文**：原 `turn_end` 错误处理用
+  `pi.sendMessage({ customType: "key-pool", content: "⚠️ #1 [quota]..." })` 推送切 key 状态。
+  pi-coding-agent 的 `sendCustomMessage` 实现会把 custom_message 推入
+  `agent.state.messages`，导致 AI 下一轮看到 "key-pool: switched key #1 → #2" 这种
+  消息并可能误以为用户要它切模型。改为 `ctx.ui.notify(...)` 纯 UI 通知，不进 LLM 上下文。
+
+### Added
+- **回归测试** `tests/no-leak-to-llm.test.ts`：静态检查 `pi.sendMessage` 调用数
+  必须为 0；`pi.sendUserMessage` 传原始用户内容。
+
 ## [0.3.1] - 2026-06-02
 
 ### Fixed

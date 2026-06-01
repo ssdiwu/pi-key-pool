@@ -779,11 +779,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		pi.sendMessage({
-			customType: "key-pool",
-			content: `⚠️ #${result.oldKeyIndex + 1} [${classification.type}] ${errorPreview}\n   → #${result.newKeyIndex + 1}`,
-			display: true,
-		}, { deliverAs: "followUp" });
+		// UI 提示：给人类看，不注入到 LLM 上下文。
+		// 之前用的 pi.sendMessage({ customType: "key-pool", ... }) 会被推入 agent.state.messages
+		// （见 agent-session.js 的 sendCustomMessage 实现），AI 下一轮可能看到并误以为用户要切模型。
+		ctx.ui.notify(`⚠️ key-pool: #${result.oldKeyIndex + 1} [${classification.type}] ${errorPreview}\n   → #${result.newKeyIndex + 1}`, "info");
 
 		if (attempt > cfg.maxRetries) {
 			ctx.ui.notify(`❌ key-pool: max retries (${cfg.maxRetries}) reached; auto retry stopped`, "error");
