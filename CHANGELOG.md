@@ -5,6 +5,28 @@
 
 ## [Unreleased]
 
+### Changed
+- **按需分配 + provider 白名单**：session_start 不再预先分配 key，改为在 `model_select` 事件中
+  按需建立 session → provider 绑定。`turn_end` 错误处理加 provider 白名单判断：当前
+  `ctx.model.provider` 不在 `keys.json` 登记的 provider 集合中时直接 `return`，不切 key、不重试、
+  不发 key-pool 通知。
+
+### Fixed
+- **错误接管越权**：当 session 使用非 managed provider（如 zai/GLM、openai-codex）返回 429 时，
+  key-pool 之前会误以为是它管理的 key 出问题，错误地切 key、重试、熔断，导致用户看到
+  "consecutive 429/quota errors; auto retry stopped" 等与实际错误无关的提示。现在 zai 等
+  单 key provider 的 429 错误会原样上抛给用户，key-pool 不再接管。
+
+### Added
+- **bash 脚本支持按 provider 选 key**：读取新增的 `PI_KEY_POOL_PROVIDER` 环境变量，从该 provider
+  的 key 子集中分配；未设置时 fallback 到 keys.json 第一个带 provider 的 key。
+- **`autoConfigureModelsJson` 遍历所有 managed provider**：之前只注入 `keys[0].provider` 的
+  bash 脚本，现在 keys.json 中所有出现过的 provider 都会被注入。
+- **`.key-state` 按 provider 分桶**：`assignments: { [provider]: { [sessionId]: { keyIndex, since } } }`，
+  老的扁平格式仍可读取（向后兼容），首次 model_select 后自动写入新格式。
+- **集成测试** `tests/scenarios.bash.sh` 和 **单元测试** `tests/logic.test.ts`，覆盖 9 个 GWT
+  验收场景 + 11 个 provider 分桶边界用例。
+
 ## [0.2.4] - 2026-06-01
 
 ### Fixed

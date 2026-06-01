@@ -116,29 +116,69 @@ Cooldowns: capacity=30s, quota=300s, network=off
 
 ```
 /new (new session)
-  ├─ session_start → generate sessionId → assignKeyToSession()
-  ├─ write PI_KEY_POOL_SESSION_ID (process env) + .current-session fallback
-  ├─ write .key-state (assignments)
-  └─ Next request → !bash script reads session → outputs bound key ✅
+  ├─ session_start → generate sessionId → write env (no pre-allocation)
+  ├─ write PI_KEY_POOL_SESSION_ID + .current-session fallback
+  └─ Next model_select → establish session → provider binding ✅
 
-Parallel sessions
-  ├─ Session A → key #1 (exclusive)
-  ├─ Session B → key #2 (exclusive)
-  └─ Session C → key #1 (if released by A) ✅
+model_select (user switches model)
+  ├─ Read provider from ctx.model.provider
+  ├─ If provider in keys.json's managed set → write PI_KEY_POOL_PROVIDER env + assignKeyToProviderSession()
+  ├─ If provider NOT managed (e.g. zai/GLM, openai-codex) → clear env, key-pool ignores this provider
+  └─ Next request → !bash script reads env → outputs bound key for that provider ✅
 
-API error (429/529)
-  ├─ turn_end → classify error → mark cooled → reassign
+Parallel sessions (multi-provider)
+  ├─ Session A (xiaomi) → key #1 (xiaomi pool)
+  ├─ Session B (zai)    → zai key #1 (zai pool, independent)
+  └─ Session C (xiaomi) → key #2 (xiaomi pool) ✅
+
+API error (429/529) on MANAGED provider
+  ├─ turn_end → check ctx.model.provider is managed
+  ├─ If managed → classify error → mark cooled → reassign within that provider's pool
   ├─ write .key-state (new assignment)
   ├─ first quota/capacity failure → retryLastUserMessage() ✅
   └─ consecutive 429 or all keys cooling → stop auto-retry and show wait time ✅
 
+API error on NON-MANAGED provider (zai/GLM, openai-codex, etc.)
+  └─ turn_end → provider not in managed set → return immediately, no key switch, no retry ✅
+  (the original error is surfaced to the user untouched)
+
 Session ends (/new, /resume, exit)
-  ├─ session_shutdown → releaseSessionAssignment()
-  └─ Key becomes available for other sessions ✅
+  ├─ session_shutdown → releaseProviderSession() for all providers
+  └─ Keys become available for other sessions ✅
 
 Cooldown expires
   └─ isCooled() returns false → key becomes eligible again ✅
 ```
+
+### Provider Whitelist (key behavior change)
+
+Key-pool now only manages the providers listed in `keys.json`. Each key entry has a `provider` field, and the set of managed providers is derived from those entries.
+
+| Provider in `ctx.model.provider` | Behavior |
+|----------------------------------|----------|
+| Listed in `keys.json` (e.g. `xiaomi-token-plan-cn`) | Full key-pool behavior: rotation, cooldown, auto-retry |
+| NOT listed (e.g. `zai`, `openai-codex`) | **Key-pool does nothing** — original error surfaces to the user |
+
+This prevents key-pool from incorrectly hijacking 429 errors from providers where you only have a single key (like GLM via `zai`).
+
+### State Structure (`.key-state`)
+
+```json
+{
+  "assignments": {
+    "xiaomi-token-plan-cn": {
+      "session-uuid-1": { "keyIndex": 0, "since": 1234567890 },
+      "session-uuid-2": { "keyIndex": 1, "since": 1234567891 }
+    },
+    "zai": {
+      "session-uuid-3": { "keyIndex": 0, "since": 1234567892 }
+    }
+  },
+  "cooled": { "0": { "exhaustedAt": ..., "cooldownMs": 300000, "reason": "quota" } }
+}
+```
+
+Old flat format `{ "sessionId": { "keyIndex", "since" } }` is still read for backward compatibility but new writes use the bucketed format.
 
 ## Configuration
 
@@ -296,6 +336,20 @@ pi -e extensions/index.ts --print "hello" --no-session --provider <your-provider
 # Check pool status inside pi
 /pool-status
 ```
+
+## Testing
+
+The repo ships with integration + unit tests covering the 9 GWT scenarios.
+
+```bash
+# 集成测试：bash 脚本逻辑（需要 python3 + node）
+bash tests/scenarios.bash.sh
+
+# 单元测试：核心 provider 分桶与选择逻辑（需要 bun）
+bun tests/logic.test.ts
+```
+
+Tests use a temporary `keys.json` / `.key-state` under `$PI_KEY_POOL_TEST_DIR` (default `/tmp/key-pool-test`) so they never touch your real `~/.pi/agent/key-pool`.
 
 ## License
 
