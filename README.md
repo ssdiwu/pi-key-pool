@@ -94,6 +94,61 @@ Retry: 0/3 | Debug: OFF
 Cooldowns: capacity=30s, quota=300s, network=off
 ```
 
+## Provider 静态配置（归 auth.json 管，不是 keys.json）
+
+keys.json 只负责**「哪个 Provider 用哪些 key 轮换」**——key 字符串、provider 名、label。
+
+**Provider 静态配置**（endpoint / region / cache TTL / proxy / 自定义 header）一律放在 pi 的 `auth.json` 对应 entry 的 `env` 字段里，**不要**放进 keys.json，也**不要**写在 shell 环境里。
+
+> 原理（pi 0.79.5+）：`auth.json` 里 api_key entry 的 `env` 会由 pi 主进程读取并通过 `getProviderEnv(provider)` 传给 Provider SDK，参与 HTTP 请求构造（拼 baseUrl、注入 cache header 等）。env 按 **Provider 名**索引，跟 pool 切换哪个 key 字符串完全无关，自动跟随。
+
+### 适用场景
+
+| 场景 | 放哪里 | 示例 env key |
+|------|--------|--------------|
+| Cloudflare AI Gateway 账户/网关 | `auth.json` | `CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_GATEWAY_ID` |
+| Azure OpenAI deployment | `auth.json` | `AZURE_OPENAI_ENDPOINT` |
+| Google Vertex region/project | `auth.json` | `GOOGLE_VERTEX_PROJECT`、`GOOGLE_VERTEX_REGION` |
+| Amazon Bedrock region | `auth.json` | `AWS_REGION` |
+| 缓存保留 / proxy | `auth.json` | 按 Provider SDK 文档 |
+| **多 key 轮换 / 冷却 / 自动重试** | `keys.json` | — |
+
+### 示例：双文件分工
+
+```jsonc
+// ~/.pi/agent/auth.json — Provider 静态配置（每 Provider 一条 entry）
+{
+  "cloudflare-ai-gateway": {
+    "type": "api_key",
+    "key": "placeholder-injected-by-pool",  // 占位，真值由 pool 在运行时注入
+    "env": {
+      "CLOUDFLARE_ACCOUNT_ID": "acct-abc",
+      "CLOUDFLARE_GATEWAY_ID": "gw-xyz"
+    }
+  }
+}
+```
+
+```jsonc
+// ~/.pi/agent/key-pool/keys.json — pool 池子（只放 key/provider/label）
+{
+  "keys": [
+    { "key": "tp-real-key-1", "provider": "cloudflare-ai-gateway", "label": "primary" },
+    { "key": "tp-real-key-2", "provider": "cloudflare-ai-gateway", "label": "backup" }
+  ]
+}
+```
+
+### 为什么 env 不归 keys.json
+
+- keys.json 是 pool 自己的状态文件，env 跟着 pool 走没意义
+- env 是 per-Provider 的，pool 切换 key 时 env 应该**恒定跟随** Provider，不该被 pool 干扰
+- 让两个文件各管一件事，避免「env 在 keys.json 改了但 pi 没读到」的坑
+
+### 边界：bash 子进程看不到 env
+
+pool 的 `get-current-key.sh` 是被 pi 用 `execSync` 调起的，**不会**继承 `auth.json` 的 env。如果你想根据 auth.json 的 env 做不同分支——做不到，请走 `process.env` 或重新设计。
+
 ## How It Works
 
 ```
@@ -289,6 +344,16 @@ Each type has independent cooldown and behavior. Network errors never trigger ke
 pi loads `auth.json` **before** extensions are initialized. Writing to auth.json from an extension is too late — the current session would still use the old key.
 
 Instead, we use `!bash get-current-key.sh` in `models.json`'s `apiKey` field. This executes on **every API request**, reading the latest `.key-state` plus `PI_KEY_POOL_SESSION_ID` (with `.current-session` as fallback) to output the correct key. No timing issues.
+
+### Why doesn't keys.json have an `env` field?
+
+Provider 静态配置（endpoint / region / cache TTL / proxy / 自定义 header）归 `auth.json` 的 `env` 字段管，**不归 keys.json 管**。三个原因：
+
+1. **接缝不同**：pi 的 auth.json 是按 Provider 名索引（每 Provider 一条 entry），pool 的 keys.json 是同 Provider 多 key 池子。两边关注点不同，硬合并只会让一边退化。
+2. **env 是 per-Provider 的**（pi 0.79.5+ `getProviderEnv(provider)` 按 provider 名取），pool 切换 key 字符串时 env 应恒定跟随 Provider，不该被 pool 干扰。
+3. **bash 子进程拿不到**：pool 的 `!bash` 是被 `execSync` 调起的，看不到 auth.json 的 env；即使在 keys.json 里加 env 字段也传不到 SDK，反而误导用户。
+
+分工：`keys.json` 管 key 字符串 + provider + label，`auth.json` 管 Provider 静态配置。详见上文「Provider 静态配置」一节。
 
 ### Why session-based binding (not rotation)?
 
